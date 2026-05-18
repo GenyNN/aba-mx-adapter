@@ -1,0 +1,54 @@
+{
+  "cookies": [],
+  "origins": [
+    {
+      "origin": "https://web.max.ru",
+      "localStorage": [
+        {
+          "name": "__oneme-persistent-cache-enabled",
+          "value": "false"
+        },
+        {
+          "name": "__oneme_locale",
+          "value": "en"
+        },
+        {
+          "name": "__oneme_auth",
+          "value": "{\"token\":\"An_Sx6HQ9HDiFyg58nwuLfN_ELVDtK0V21HZEpIcZ77I8_gdNT7Sjcnk8MYjYS7IAdP8ub4fTvRvt6MLG6-txhbkzfFUW7uA-BFwaHi5AausMvWRYgq0uxBZX4YTfxhI178SKpFBpHD4crwm4Yg7Dh8wLecNHEs3I7z0kqRJOSWENB5kEEnG9ZOdu_bihpeKEobdOHCz5XpZ1aPw3-U14CzqVPPltC6hKWsG1pf3zx8lX9yV172i9G_fVPg3DWuX-ATWmWDtSNHRMpItrklbbBCEkh-npu3N6TZroXBm_sN6htLespmv0vlgwETi5-iWhnz7YRnOexYXL7dzomwJe3cj5_2TFkXjQ8XyA9UKCnek0wVBanenHlPK5ey5nLnqmTlLcFPhDu9y25hx3vOFGyHE57ubGLInfhtbh1MOwja-Hr-EZGvMxlXcSLCELhAYHa-lPDw5a79eNWr-6eL0cKFD-qO14zkC4M3Yy-Mt8c0n8tDyLAWTOrKDtEnZFcq059VEY6VeTJq4C-6I5h3B-cJQ3Y26tkGnDALdg0fe7HAR4iuaPKqSWYaVsCx874Tl3ndYdQjboGnMeE045XKojgsWw9_4NZQfBi3a0On4fL2Uvgink0fy7Cx5R-xVky6niptDNjIm1sqL06xqxiKewNOJ_pxjEGgcG7fWuak2cRXQfogttmVNjmxn71Tk24KWTU_yP6s\",\"viewerId\":195924522}"
+        },
+        {
+          "name": "__oneme_theme",
+          "value": "{\"colorScheme\":\"system\",\"colorTheme\":\"space\"}"
+        },
+        {
+          "name": "__server_config_overrides__",
+          "value": "{}"
+        },
+        {
+          "name": "__oneme_device_id",
+          "value": "12012026-6608-45e3-a79a-e08b47e388c3"
+        },
+        {
+          "name": "__oneme_aside_width",
+          "value": "393"
+        },
+        {
+          "name": "tracer-device-id",
+          "value": "4f408e91-ad85-41e0-be60-307b0f4be9f6"
+        },
+        {
+          "name": "__oneme_calls_auth_token",
+          "value": "$HYCTAjVsze2quY9K8xJDNjig6l6guolufu0uvOEStf4xyHBjzgo6Uah9I8OrG4NlMsrq8uIbLi0"
+        },
+        {
+          "name": "__oneme_informer",
+          "value": "{\"lastShowedBannerId\":\"audio_transcription\",\"banners\":{\"audio_transcription\":{\"showCounter\":1}}}"
+        },
+        {
+          "name": "_okcls_uuid",
+          "value": "\"8aca8986-0a54-4259-8384-b491ada52809\""
+        }
+      ]
+    }
+  ]
+}
