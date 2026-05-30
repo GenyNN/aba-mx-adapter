@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from max_playwright_sender import (
     DEFAULT_MESSAGE_TEMPLATE,
     DEFAULT_SESSION_FILE,
+    check_sent_messages_from_xls,
     send_messages_from_xls,
 )
 
@@ -62,11 +63,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run API/Rabbit or MAX sender mode")
     parser.add_argument(
         "--mode",
-        choices=["api", "mx-send"],
+        choices=["api", "mx-send", "mx-check"],
         default="api",
-        help="api: FastAPI + RabbitMQ consumer, mx-send: XLS рассылка в MAX",
+        help="api: FastAPI + RabbitMQ; mx-send: рассылка; mx-check: проверка ответов в MAX",
     )
-    parser.add_argument("--xls", default="Klienty_301.xls", help="Путь к .xls для mx-send")
+    parser.add_argument(
+        "--xls",
+        default="Klienty_301.xls",
+        help="Путь к .xls для mx-send / mx-check",
+    )
     parser.add_argument(
         "--template",
         default=DEFAULT_MESSAGE_TEMPLATE,
@@ -99,6 +104,17 @@ if __name__ == "__main__":
                 delay_seconds=args.delay,
                 session_file=args.session,
                 attachment_path=args.attachment,
+            )
+        )
+        raise SystemExit(0)
+
+    if args.mode == "mx-check":
+        asyncio.run(
+            check_sent_messages_from_xls(
+                args.xls,
+                headless=args.headless,
+                delay_seconds=args.delay,
+                session_file=args.session,
             )
         )
         raise SystemExit(0)

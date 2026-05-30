@@ -24,9 +24,15 @@ DEFAULT_MESSAGE_TEMPLATE = (
 )
 STATUS_COLUMN_HEADER = "Статус MAX отправки"
 STATUS_COLUMN_SENT_OK_LABEL = "Отправлено"
+REPLY_COLUMN_HEADER = "Ответ пользователя"
+REPLY_NOT_READ_LABEL = "не прочитано"
+REPLY_READ_LABEL = "прочитано"
 
 _STATUS_HEADER_ALIASES_CASEFOLD = frozenset(
     {"статус max отправки", "статус max", "max отправлено", "отправлено max"}
+)
+_REPLY_HEADER_ALIASES_CASEFOLD = frozenset(
+    {"ответ пользователя", "ответ", "ответ max"}
 )
 
 
@@ -44,6 +50,14 @@ class SendMaxMessageResult:
 
     sent_ok: bool
     status_note: str
+
+
+@dataclass(frozen=True)
+class CheckMaxMessageResult:
+    """Результат проверки последнего сообщения в открытом чате."""
+
+    reply_value: str
+    check_ok: bool = True
 
 
 CellValue = Union[str, float, int, None]
@@ -85,6 +99,40 @@ def normalize_phone_for_max(raw: CellValue) -> Optional[str]:
     return None
 
 
+def _sheet_headers_casefold(sheet) -> List[str]:
+    return [str(sheet.cell_value(0, c)).strip().casefold() for c in range(sheet.ncols)]
+
+
+def _find_column_index(headers: List[str], names: frozenset, default: Optional[int] = None) -> Optional[int]:
+    for j, h in enumerate(headers):
+        if h in names:
+            return j
+    return default
+
+
+def _load_sheet_indices(xls_path: Union[str, Path]) -> Tuple[object, object, int, int, Optional[int], Optional[int]]:
+    """Возвращает (rb, sheet0, idx_name, idx_phone, idx_status, idx_reply)."""
+    import xlrd  # type: ignore[import-untyped]
+
+    path = Path(xls_path)
+    rb = xlrd.open_workbook(str(path), formatting_info=False)
+    sheet0 = rb.sheet_by_index(0)
+    headers = _sheet_headers_casefold(sheet0)
+    idx_name = _find_column_index(headers, frozenset({"имя"}), 0)
+    idx_phone = _find_column_index(headers, frozenset({"телефон"}), 1)
+    idx_status = _find_column_index(headers, _STATUS_HEADER_ALIASES_CASEFOLD)
+    idx_reply = _find_column_index(headers, _REPLY_HEADER_ALIASES_CASEFOLD)
+    return rb, sheet0, idx_name, idx_phone, idx_status, idx_reply
+
+
+def _resolve_reply_column(sheet0, idx_status: Optional[int], idx_reply: Optional[int]) -> int:
+    if idx_reply is not None:
+        return idx_reply
+    if idx_status is not None:
+        return idx_status + 1
+    return sheet0.ncols
+
+
 def read_clients_from_xls(xls_path: Union[str, Path]) -> List[Tuple[int, str, str]]:
     """
     Читает клиентов из первого листа .xls: колонки «Имя» и «Телефон»
@@ -92,25 +140,11 @@ def read_clients_from_xls(xls_path: Union[str, Path]) -> List[Tuple[int, str, st
     Возвращает тройки (индекс_строки_листа_как_в_xlrd, имя, телефон_для_max).
     Индекс строки — тот же, что нужен xlwt для записи в эту строку (0-based).
     """
-    import xlrd  # type: ignore[import-untyped]
-
     path = Path(xls_path)
     if not path.exists():
         raise MaxMessengerError(f"Файл не найден: {path}")
 
-    book = xlrd.open_workbook(str(path))
-    sheet = book.sheet_by_index(0)
-    headers = [str(sheet.cell_value(0, c)).strip().casefold() for c in range(sheet.ncols)]
-    idx_name = idx_phone = None
-    for j, h in enumerate(headers):
-        if h == "имя":
-            idx_name = j
-        elif h == "телефон":
-            idx_phone = j
-    if idx_name is None:
-        idx_name = 0
-    if idx_phone is None:
-        idx_phone = 1
+    _, sheet, idx_name, idx_phone, _, _ = _load_sheet_indices(path)
 
     out: List[Tuple[int, str, str]] = []
     for r in range(1, sheet.nrows):
@@ -126,6 +160,38 @@ def read_clients_from_xls(xls_path: Union[str, Path]) -> List[Tuple[int, str, st
     return out
 
 
+def read_rows_for_mx_check(xls_path: Union[str, Path]) -> List[Tuple[int, str, str]]:
+    """
+    Строки для проверки: (индекс_строки, телефон_для_max, значение_колонки_«Статус MAX отправки»).
+    """
+    path = Path(xls_path)
+    if not path.exists():
+        raise MaxMessengerError(f"Файл не найден: {path}")
+
+    _, sheet, _, idx_phone, idx_status, _ = _load_sheet_indices(path)
+    out: List[Tuple[int, str, str]] = []
+    for r in range(1, sheet.nrows):
+        phone_raw = sheet.cell_value(r, idx_phone)
+        phone = normalize_phone_for_max(phone_raw)
+        if phone is None:
+            continue
+        status_text = ""
+        if idx_status is not None:
+            raw = sheet.cell_value(r, idx_status)
+            status_text = str(raw).strip() if raw is not None else ""
+        out.append((r, phone, status_text))
+    return out
+
+
+def _should_check_sent_status(send_status: str) -> bool:
+    s = send_status.strip().casefold()
+    if not s or "не отправлено" in s:
+        return False
+    return s == STATUS_COLUMN_SENT_OK_LABEL.casefold() or s.startswith(
+        STATUS_COLUMN_SENT_OK_LABEL.casefold()
+    )
+
+
 def write_row_status_to_xls(
     xls_path: Union[str, Path],
     row_index_xlrd: int,
@@ -135,28 +201,49 @@ def write_row_status_to_xls(
     Пишет отметку в первый лист того же .xls: колонка с заголовком «Статус MAX отправки»
     или уже существующая колонка с таким признаком иначе — новая самая правая колонка.
     """
-    import xlrd  # type: ignore[import-untyped]
-    from xlutils.copy import copy  # type: ignore[import-untyped]
-
     path = Path(xls_path)
-    rb = xlrd.open_workbook(str(path), formatting_info=False)
-    sheet0 = rb.sheet_by_index(0)
-    headers_casefold = [
-        str(sheet0.cell_value(0, c)).strip().casefold() for c in range(sheet0.ncols)
-    ]
-    status_col: Optional[int] = None
-    for j, h in enumerate(headers_casefold):
-        if h in _STATUS_HEADER_ALIASES_CASEFOLD:
-            status_col = j
-            break
-    if status_col is None:
-        status_col = sheet0.ncols
+    rb, sheet0, _, _, idx_status, _ = _load_sheet_indices(path)
+    status_col = idx_status if idx_status is not None else sheet0.ncols
+    _write_xls_cell(path, rb, sheet0, row_index_xlrd, status_col, status_text, STATUS_COLUMN_HEADER)
+
+
+def write_row_reply_to_xls(
+    xls_path: Union[str, Path],
+    row_index_xlrd: int,
+    reply_text: str,
+) -> None:
+    """Пишет значение в колонку «Ответ пользователя» (сразу после колонки статуса отправки)."""
+    path = Path(xls_path)
+    rb, sheet0, _, _, idx_status, idx_reply = _load_sheet_indices(path)
+    reply_col = _resolve_reply_column(sheet0, idx_status, idx_reply)
+    _write_xls_cell(path, rb, sheet0, row_index_xlrd, reply_col, reply_text, REPLY_COLUMN_HEADER)
+
+
+def _write_xls_cell(
+    path: Path,
+    rb: object,
+    sheet0: object,
+    row_index_xlrd: int,
+    col_index: int,
+    cell_text: str,
+    header_if_new_col: str,
+) -> None:
+    from xlutils.copy import copy  # type: ignore[import-untyped]
 
     wb = copy(rb)
     ws = wb.get_sheet(0)
-    if status_col >= sheet0.ncols:
-        ws.write(0, status_col, STATUS_COLUMN_HEADER)
-    ws.write(row_index_xlrd, status_col, status_text)
+    if col_index >= sheet0.ncols:
+        ws.write(0, col_index, header_if_new_col)
+    else:
+        existing_hdr = str(sheet0.cell_value(0, col_index)).strip().casefold()
+        known = (
+            _STATUS_HEADER_ALIASES_CASEFOLD
+            if header_if_new_col == STATUS_COLUMN_HEADER
+            else _REPLY_HEADER_ALIASES_CASEFOLD
+        )
+        if not existing_hdr or existing_hdr not in known:
+            ws.write(0, col_index, header_if_new_col)
+    ws.write(row_index_xlrd, col_index, cell_text)
     wb.save(str(path))
 
 
@@ -294,6 +381,246 @@ async def _upload_attachment(page: Page, file_path: str) -> None:
 # В функции send_max_message исправьте порядок, если нужно отправить текст ВМЕСТЕ с файлом:
 # Но если вам нужно два сообщения (текст, потом файл), ваш текущий порядок в send_max_message подходит.
 
+_SEARCH_PLUS_BUTTON_SELECTORS = [
+    "button:has(use[href='#icon_plus_mini'])",
+]
+_FIND_BY_NUMBER_ITEM_MENU_SELECTORS = [
+    "[role='menuitem']:has-text('Найти по номеру')",
+    "[role='menuitem']:has-text('Search by number')",
+]
+_CONTACT_NUMBER_INPUT_SELECTORS = [
+    "form[id='findContact'] input",
+]
+_FIND_CONTACT_SUBMIT_SELECTORS = [
+    "button[aria-label*='Найти в MAX']",
+    "button[aria-label*='Find in MAX']",
+]
+_MESSAGE_INPUT_SELECTORS = [
+    "div[contenteditable='true'][role='textbox']",
+    "div[contenteditable='true'][data-testid*='composer']",
+    "textarea[placeholder*='Сообщение']",
+    "textarea[placeholder*='Message']",
+    "div[placeholder*='Сообщение']",
+    "div[placeholder*='Message']",
+]
+_OPENED_CHAT_SELECTORS = [
+    ".openedChat",
+    "[class*='openedChat']",
+]
+_CHAT_HISTORY_SELECTORS = [
+    ".openedChat .history",
+    "[class*='openedChat'] [class*='history']",
+]
+_BACK_BUTTON_SELECTORS = [
+    "button.backBtn",
+    ".openedChat button.backBtn",
+    "button:has(use[href='#icon_arrow_left'])",
+]
+
+_PARSE_LAST_MESSAGE_JS = """
+() => {
+  const chat = document.querySelector('.openedChat') ||
+    document.querySelector('[class*="openedChat"]');
+  if (!chat) return { error: 'no_chat' };
+  const history = chat.querySelector('.history.svelte-3850xr') ||
+    chat.querySelector('[class*="history"]');
+  if (!history) return { error: 'no_history' };
+  const wrappers = [...history.querySelectorAll('div[class*="messageWrapper"]')];
+  if (!wrappers.length) return { error: 'no_messages' };
+  const last = wrappers[wrappers.length - 1];
+  const isOut = (last.className || '').includes('messageWrapper--isOut');
+  const bubbleRoot = last.querySelector('[data-bubbles-variant]');
+  const variant = bubbleRoot ? bubbleRoot.getAttribute('data-bubbles-variant') : null;
+  const statusUse = last.querySelector('.indicators use');
+  const statusIcon = statusUse ? (statusUse.getAttribute('href') || '') : '';
+  const textEl = last.querySelector('.bubble span.text') ||
+    last.querySelector('.bubble .text');
+  let text = '';
+  if (textEl) {
+    text = (textEl.textContent || '').replace(/\\s+/g, ' ').trim();
+  }
+  return { isOut, variant, statusIcon, text };
+}
+"""
+
+
+async def _leave_opened_chat_if_needed(page: Page) -> None:
+    """Возврат к списку чатов перед поиском следующего номера (один браузер на много строк)."""
+    if await page.locator(".openedChat, [class*='openedChat']").count() == 0:
+        return
+    back_selector = await _wait_and_get_first(page, _BACK_BUTTON_SELECTORS, timeout_ms=2000)
+    if back_selector:
+        await page.click(back_selector)
+        await page.wait_for_timeout(600)
+
+
+async def _open_chat_by_phone(page: Page, phone: str) -> bool:
+    """Открывает чат по номеру (как при отправке). True, если появился openedChat или поле ввода."""
+    await _leave_opened_chat_if_needed(page)
+    open_selector = await _wait_and_get_first(page, _SEARCH_PLUS_BUTTON_SELECTORS, timeout_ms=5000)
+    if not open_selector:
+        raise MaxMessengerError("Button 'Начать общение' not found.")
+    await page.click(open_selector)
+    await page.wait_for_timeout(700)
+
+    find_by_number_selector = await _wait_and_get_first(
+        page, _FIND_BY_NUMBER_ITEM_MENU_SELECTORS, timeout_ms=5000
+    )
+    if not find_by_number_selector:
+        raise MaxMessengerError("Menu item 'Найти по номеру' not found after opening the menu.")
+    await page.click(find_by_number_selector)
+    await page.wait_for_timeout(600)
+
+    phone_input_selector = await _wait_and_get_first(
+        page, _CONTACT_NUMBER_INPUT_SELECTORS, timeout_ms=8000
+    )
+    if not phone_input_selector:
+        raise MaxMessengerError("Phone input in form 'findContact' not found.")
+
+    await page.click(phone_input_selector)
+    await page.fill(phone_input_selector, "")
+    await page.type(phone_input_selector, phone, delay=30)
+    await page.wait_for_timeout(250)
+
+    submit_selector = await _wait_and_get_first(page, _FIND_CONTACT_SUBMIT_SELECTORS, timeout_ms=8000)
+    if not submit_selector:
+        raise MaxMessengerError("Submit button 'Найти в MAX' not found.")
+    await page.click(submit_selector)
+    await page.wait_for_timeout(5800)
+
+    if await _wait_and_get_first(page, _OPENED_CHAT_SELECTORS, timeout_ms=8000):
+        return True
+    if await _wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=3000):
+        return True
+    return False
+
+
+def _reply_from_last_message_payload(payload: dict) -> CheckMaxMessageResult:
+    if payload.get("error"):
+        return CheckMaxMessageResult(
+            reply_value=f"ошибка проверки: {payload['error']}",
+            check_ok=False,
+        )
+    variant = (payload.get("variant") or "").strip().casefold()
+    is_out = bool(payload.get("isOut"))
+    status_icon = str(payload.get("statusIcon") or "")
+    text = str(payload.get("text") or "").strip()
+
+    if variant == "incoming" or not is_out:
+        return CheckMaxMessageResult(reply_value=text or "(пустой ответ)")
+
+    if "icon_status_read" in status_icon:
+        return CheckMaxMessageResult(reply_value=REPLY_READ_LABEL)
+    if "icon_status_delivered" in status_icon:
+        return CheckMaxMessageResult(reply_value=REPLY_NOT_READ_LABEL)
+    return CheckMaxMessageResult(reply_value=REPLY_NOT_READ_LABEL)
+
+
+async def check_max_message_reply(
+    phone: str,
+    *,
+    headless: bool = True,
+    session_file: str = DEFAULT_SESSION_FILE,
+    base_url: str = DEFAULT_BASE_URL,
+) -> CheckMaxMessageResult:
+    """Открывает чат по телефону и определяет статус последнего сообщения."""
+    session_path = Path(session_file)
+    if not session_path.exists():
+        raise MaxMessengerError(f"Session file not found: {session_path}")
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=headless)
+            context = await browser.new_context(storage_state=str(session_path))
+            try:
+                await _block_heavy_resources(context)
+                page = await context.new_page()
+                await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(2000)
+
+                if not await _open_chat_by_phone(page, phone):
+                    return CheckMaxMessageResult(
+                        reply_value="ошибка проверки: чат не открыт",
+                        check_ok=False,
+                    )
+
+                await _wait_and_get_first(page, _CHAT_HISTORY_SELECTORS, timeout_ms=8000)
+                payload = await page.evaluate(_PARSE_LAST_MESSAGE_JS)
+                return _reply_from_last_message_payload(payload)
+            finally:
+                await context.close()
+                await browser.close()
+    except PlaywrightTimeoutError as exc:
+        raise MaxMessengerError(f"Timeout while checking Max web: {exc}") from exc
+    except PlaywrightError as exc:
+        raise MaxMessengerError(f"Playwright failed: {exc}") from exc
+
+
+async def check_sent_messages_from_xls(
+    xls_path: Union[str, Path],
+    *,
+    headless: bool = True,
+    delay_seconds: float = 3.0,
+    session_file: str = DEFAULT_SESSION_FILE,
+    base_url: str = DEFAULT_BASE_URL,
+) -> None:
+    """
+    Проверяет ответы по строкам, где «Статус MAX отправки» = «Отправлено».
+    Строки с «Не отправлено» пропускаются. Результат пишется в «Ответ пользователя».
+    """
+    rows = read_rows_for_mx_check(xls_path)
+    if not rows:
+        raise MaxMessengerError("В файле нет строк с валидным телефоном.")
+
+    path_obj = Path(xls_path)
+    session_path = Path(session_file)
+    if not session_path.exists():
+        raise MaxMessengerError(f"Session file not found: {session_path}")
+
+    to_check = [(r, phone, status) for r, phone, status in rows if _should_check_sent_status(status)]
+    if not to_check:
+        raise MaxMessengerError(
+            'Нет строк для проверки: нужна колонка «Статус MAX отправки» со значением «Отправлено».'
+        )
+
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=headless)
+            context = await browser.new_context(storage_state=str(session_path))
+            try:
+                await _block_heavy_resources(context)
+                page = await context.new_page()
+                await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(2000)
+
+                for i, (sheet_row_idx, phone, _status) in enumerate(to_check):
+                    try:
+                        if not await _open_chat_by_phone(page, phone):
+                            result = CheckMaxMessageResult(
+                                reply_value="ошибка проверки: чат не открыт",
+                                check_ok=False,
+                            )
+                        else:
+                            await _wait_and_get_first(page, _CHAT_HISTORY_SELECTORS, timeout_ms=8000)
+                            payload = await page.evaluate(_PARSE_LAST_MESSAGE_JS)
+                            result = _reply_from_last_message_payload(payload)
+                    except MaxMessengerError as exc:
+                        result = CheckMaxMessageResult(
+                            reply_value=f"ошибка проверки: {exc}",
+                            check_ok=False,
+                        )
+
+                    write_row_reply_to_xls(path_obj, sheet_row_idx, result.reply_value)
+                    if i < len(to_check) - 1 and delay_seconds > 0:
+                        await asyncio.sleep(delay_seconds)
+            finally:
+                await context.close()
+                await browser.close()
+    except PlaywrightTimeoutError as exc:
+        raise MaxMessengerError(f"Timeout while checking Max web: {exc}") from exc
+    except PlaywrightError as exc:
+        raise MaxMessengerError(f"Playwright failed: {exc}") from exc
+
 
 async def send_max_message(
     phone: str,
@@ -324,50 +651,6 @@ async def send_max_message(
     if not session_path.exists():
         raise MaxMessengerError(f"Session file not found: {session_path}")
 
-    search_plus_button_selectors = [
-        #"button[aria-label*='Начать общение']",
-        #"button:has-text('Начать общение')",
-        "button:has(use[href='#icon_plus_mini'])",
-    ]
-    find_by_number_item_menu_selectors = [
-        "[role='menuitem']:has-text('Найти по номеру')",
-        #"[role='button']:has-text('Найти по номеру')",
-        #"button:has-text('Найти по номеру')",
-        #"text=Найти по номеру",
-
-        "[role='menuitem']:has-text('Search by number')",
-        #"[role='button']:has-text('Search by number')",
-        #"button:has-text('Search by number')",
-        #"text=Search by number",
-    ]
-
-    """find_contact_form_selectors = [
-        "form[id='findContact']",
-        "form:has(button:has-text('Найти в MAX'))",
-        "form:has-text('Найти в MAX')",
-    ]"""
-
-    contact_number_to_find_input_selectors = [
-        "form[id='findContact'] input",
-        #"form[id='findContact'] input[type='tel']",
-        #"form[id='findContact'] input[name*='phone']",
-        #"form input[placeholder*='номер']",
-        #"form input[placeholder*='телефон']",
-    ]
-    find_contact_submit_selectors = [
-        "button[aria-label*='Найти в MAX']",
-        "button[aria-label*='Find in MAX']",
-    ]
-
-    message_input_selectors = [
-        "div[contenteditable='true'][role='textbox']",
-        "div[contenteditable='true'][data-testid*='composer']",
-        "textarea[placeholder*='Сообщение']",
-        "textarea[placeholder*='Message']",
-        "div[placeholder*='Сообщение']",
-        "div[placeholder*='Message']",
-    ]
-
     send_button_selectors = [
         "button:has-text('Отправить')",
         "button:has-text('Send')",
@@ -387,51 +670,15 @@ async def send_max_message(
                 await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
                 await page.wait_for_timeout(2000)
 
-                # 1) Open "new chat/contact" menu by clicking "Начать общение".
-                open_selector = await _wait_and_get_first(page, search_plus_button_selectors, timeout_ms=5000)
-                if not open_selector:
-                    raise MaxMessengerError("Button 'Начать общение' not found.")
-                await page.click(open_selector)
-                await page.wait_for_timeout(700)
-
-                # 2) Click menu item "Найти по номеру" from dynamic popover.
-                find_by_number_item_menu_selector = await _wait_and_get_first(
-                    page, find_by_number_item_menu_selectors, timeout_ms=5000
-                )
-                if not find_by_number_item_menu_selector:
-                    raise MaxMessengerError(
-                        "Menu item 'Найти по номеру' not found after opening the menu."
-                    )
-                await page.click(find_by_number_item_menu_selector)
-                await page.wait_for_timeout(600)
-
-                contact_number_to_find_input_selector = await _wait_and_get_first(
-                    page, contact_number_to_find_input_selectors, timeout_ms=8000
-                )
-                if not contact_number_to_find_input_selector:
-                    raise MaxMessengerError("Phone input in form 'findContact' not found.")
-
-                await page.click(contact_number_to_find_input_selector)
-                await page.fill(contact_number_to_find_input_selector, "")
-                await page.type(contact_number_to_find_input_selector, phone, delay=30)
-                await page.wait_for_timeout(250)
-
-                # 4) Submit the form by clicking "Найти в MAX".
-                find_contact_submit_selector = await _wait_and_get_first(
-                    page, find_contact_submit_selectors, timeout_ms=8000
-                )
-                if not find_contact_submit_selector:
-                    raise MaxMessengerError("Submit button 'Найти в MAX' not found.")
-                await page.click(find_contact_submit_selector)
-                await page.wait_for_timeout(5800)
+                await _open_chat_by_phone(page, phone)
 
                 message_selector = await _wait_and_get_first(
-                    page, message_input_selectors, timeout_ms=1000
+                    page, _MESSAGE_INPUT_SELECTORS, timeout_ms=1000
                 )
                 if not message_selector:
                     return SendMaxMessageResult(
                         sent_ok=False,
-                        status_note="Не отправлено: поле ввода сообщения не найдено на странице",
+                        status_note="Не отправлено",
                     )
 
                 await page.click(message_selector)
@@ -488,15 +735,21 @@ def _resolve_xls_path(spec: str) -> Path:
 
 async def _cli_main_async() -> None:
     parser = argparse.ArgumentParser(
-        description="Отправка в MAX по номеру или рассылка из .xls (Klienty_301.xls и др.)."
+        description="Отправка в MAX по номеру, рассылка или проверка ответов из .xls."
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["send", "check"],
+        default="send",
+        help="send: рассылка; check: проверка ответов по колонке статуса",
     )
     parser.add_argument(
         "--xls",
         metavar="ФАЙЛ",
         default=None,
         help=(
-            "Путь к Excel .xls: читаются строки клиентов, колонки «Имя» и «Телефон». "
-            "Если передано только имя файла — ищется рядом с этим скриптом или по текущему каталогу."
+            "Путь к Excel .xls: колонки «Имя», «Телефон», «Статус MAX отправки». "
+            "Если передано только имя файла — ищется рядом с этим скриптом."
         ),
     )
     parser.add_argument(
@@ -527,14 +780,22 @@ async def _cli_main_async() -> None:
     args = parser.parse_args()
     if args.xls:
         xls_path = _resolve_xls_path(args.xls)
-        await send_messages_from_xls(
-            xls_path,
-            message_template=args.template,
-            headless=args.headless,
-            delay_seconds=args.delay,
-            session_file=args.session,
-            attachment_path=args.attachment,
-        )
+        if args.mode == "check":
+            await check_sent_messages_from_xls(
+                xls_path,
+                headless=args.headless,
+                delay_seconds=args.delay,
+                session_file=args.session,
+            )
+        else:
+            await send_messages_from_xls(
+                xls_path,
+                message_template=args.template,
+                headless=args.headless,
+                delay_seconds=args.delay,
+                session_file=args.session,
+                attachment_path=args.attachment,
+            )
     else:
         await _demo()
 
