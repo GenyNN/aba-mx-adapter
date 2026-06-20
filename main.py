@@ -1,126 +1,161 @@
-import argparse
 import asyncio
 import json
 import logging
-import threading
+import os
+from datetime import datetime
+from typing import List, Optional
 
-import pika
-from fastapi import FastAPI
-
+import aio_pika
+import httpx
+from pydantic import BaseModel, Field
+#--mode mx-check --xls Klienty_301.xls
 from max_playwright_sender import (
-    DEFAULT_MESSAGE_TEMPLATE,
-    DEFAULT_SESSION_FILE,
-    check_sent_messages_from_xls,
-    send_messages_from_xls,
+    MaxBrowserManager,
+    logger,
+    normalize_phone_for_max,
 )
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- Configuration ---
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
+QUEUE_SEND = "tasks.messages.send"
+QUEUE_POLL = "tasks.messages.poll_replies"
 
-#using fast api
-app = FastAPI()
+# --- Models ---
+class SendTask(BaseModel):
+    task_id: str
+    campaign_id: str
+    messenger: str
+    phone: str
+    message_text: str
 
-# RabbitMQ consumer function
-def consume_rabbitmq():
-    try:
-        connection = pika.BlockingConnection(pika.ConnectionParameters('127.0.0.1'))
-        channel = connection.channel()
-        channel.queue_declare(queue='mx_tasks', durable=True)
-        
-        def callback(ch, method, properties, body):
+class CallbackPayload(BaseModel):
+    task_id: str
+    status: str
+    error_message: str = ""
+    sent_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+
+class ReplyItem(BaseModel):
+    phone: str
+    reply_text: str
+    replied_at: str
+
+class BatchReplyPayload(BaseModel):
+    campaign_id: str
+    replies: List[ReplyItem]
+
+class PollTask(BaseModel):
+    campaign_id: str
+    phones: List[str]
+
+# --- Worker Logic ---
+
+class MaxWorkerDaemon:
+    def __init__(self):
+        self.browser_manager = MaxBrowserManager(headless=False)
+        self.http_client = httpx.AsyncClient(base_url=ORCHESTRATOR_URL, timeout=30.0)
+
+    async def send_callback(self, payload: CallbackPayload):
+        try:
+            logger.info(f"Sending callback for task {payload.task_id}: {payload.status}")
+            resp = await self.http_client.post("/api/v1/workers/callback", json=payload.model_dump())
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to send callback to orchestrator: {e}")
+
+    async def send_replies_webhook(self, payload: BatchReplyPayload):
+        try:
+            logger.info(f"Sending batch replies for campaign {payload.campaign_id}")
+            resp = await self.http_client.post("/api/v1/workers/replies-webhook", json=payload.model_dump())
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error(f"Failed to send replies webhook: {e}")
+
+    async def process_send_task(self, message: aio_pika.IncomingMessage):
+        async with message.process():
             try:
-                message = json.loads(body)
-                logger.info("Received message from RabbitMQ:")
-                logger.info(json.dumps(message, indent=2))
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to decode JSON: {e}, body: {body}")
+                body = json.loads(message.body.decode())
+                task = SendTask(**body)
+                logger.info(f"Processing send task: {task.task_id} for {task.phone}")
+
+                phone = normalize_phone_for_max(task.phone)
+                if not phone:
+                    await self.send_callback(CallbackPayload(
+                        task_id=task.task_id,
+                        status="failed",
+                        error_message="Invalid phone format"
+                    ))
+                    return
+
+                result = await self.browser_manager.send_message(phone, task.message_text)
+
+
+                #await self.send_callback(CallbackPayload(
+                #    task_id=task.task_id,
+                #    status=result.status_note,
+                #    error_message=result.error_message
+                #))
+
             except Exception as e:
-                logger.error(f"Unexpected error in callback: {e}")
+                logger.exception("Error in process_send_task")
+
+    async def process_poll_task(self, message: aio_pika.IncomingMessage):
+        async with message.process():
+            try:
+                body = json.loads(message.body.decode())
+                task = PollTask(**body)
+                logger.info(f"Processing poll task for campaign: {task.campaign_id}")
+
+                replies = []
+                for phone_raw in task.phones:
+                    phone = normalize_phone_for_max(phone_raw)
+                    if not phone: continue
+                    
+                    result = await self.browser_manager.check_reply(phone)
+                    if result.check_ok and result.reply_value:
+                        replies.append(ReplyItem(
+                            phone=phone_raw,
+                            reply_text=result.reply_value,
+                            replied_at=result.replied_at or (datetime.utcnow().isoformat() + "Z")
+                        ))
+                
+                if replies:
+                    await self.send_replies_webhook(BatchReplyPayload(
+                        campaign_id=task.campaign_id,
+                        replies=replies
+                    ))
+
+            except Exception as e:
+                logger.exception("Error in process_poll_task")
+
+    async def run(self):
+        logger.info("Starting Max Worker Daemon...")
+        await self.browser_manager.start()
         
-        channel.basic_consume(queue='mx_tasks', on_message_callback=callback, auto_ack=True)
-        logger.info(' [*] Waiting for messages. To exit press CTRL+C')
-        channel.start_consuming()
-    except pika.exceptions.AMQPConnectionError as e:
-        logger.error(f"Failed to connect to RabbitMQ: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error in consumer: {e}")
-    finally:
-        if 'connection' in locals() and connection.is_open:
-            connection.close()
+        try:
+            connection = await aio_pika.connect_robust(RABBITMQ_URL)
+            async with connection:
+                channel = await connection.channel()
+                await channel.set_qos(prefetch_count=1)
 
-def start_rabbit_consumer_thread() -> None:
-    rabbit_thread = threading.Thread(target=consume_rabbitmq, daemon=True)
-    rabbit_thread.start()
+                send_queue = await channel.declare_queue(QUEUE_SEND, durable=True)
+                poll_queue = await channel.declare_queue(QUEUE_POLL, durable=True)
 
+                logger.info(f"Waiting for messages on {QUEUE_SEND} and {QUEUE_POLL}...")
+                
+                # Consume from both queues
+                await send_queue.consume(self.process_send_task)
+                await poll_queue.consume(self.process_poll_task)
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World11_11"}
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run API/Rabbit or MAX sender mode")
-    parser.add_argument(
-        "--mode",
-        choices=["api", "mx-send", "mx-check"],
-        default="api",
-        help="api: FastAPI + RabbitMQ; mx-send: рассылка; mx-check: проверка ответов в MAX",
-    )
-    parser.add_argument(
-        "--xls",
-        default="Klienty_301.xls",
-        help="Путь к .xls для mx-send / mx-check",
-    )
-    parser.add_argument(
-        "--template",
-        default=DEFAULT_MESSAGE_TEMPLATE,
-        help="Шаблон сообщения для mx-send, используйте {name}",
-    )
-    parser.add_argument("--delay", type=float, default=3.0, help="Пауза между отправками (сек)")
-    parser.add_argument(
-        "--session",
-        default=DEFAULT_SESSION_FILE,
-        help="Файл Playwright session (storage state)",
-    )
-    parser.add_argument(
-        "--headless",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Браузер без окна (по умолчанию true)",
-    )
-    parser.add_argument("--attachment", default=None, help="Опциональный файл вложения")
-    return parser.parse_args()
-
+                # Keep running
+                await asyncio.Future()
+        finally:
+            await self.browser_manager.stop()
+            await self.http_client.aclose()
 
 if __name__ == "__main__":
-    args = parse_args()
-    if args.mode == "mx-send":
-        asyncio.run(
-            send_messages_from_xls(
-                args.xls,
-                message_template=args.template,
-                headless=args.headless,
-                delay_seconds=args.delay,
-                session_file=args.session,
-                attachment_path=args.attachment,
-            )
-        )
-        raise SystemExit(0)
-
-    if args.mode == "mx-check":
-        asyncio.run(
-            check_sent_messages_from_xls(
-                args.xls,
-                headless=args.headless,
-                delay_seconds=args.delay,
-                session_file=args.session,
-            )
-        )
-        raise SystemExit(0)
-
-    start_rabbit_consumer_thread()
-    import uvicorn
-
-    # Передаем "main:app" строкой, чтобы работал reload
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    daemon = MaxWorkerDaemon()
+    try:
+        asyncio.run(daemon.run())
+    except KeyboardInterrupt:
+        logger.info("Stopped by user")
