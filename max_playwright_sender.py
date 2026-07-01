@@ -59,10 +59,14 @@ class CheckMaxMessageResult:
     is_viewed: bool = False
 
 # --- Selectors ---
-_SEARCH_PLUS_BUTTON_SELECTORS = ["button:has(use[href='#icon_plus_mini'])"]
+_SEARCH_PLUS_BUTTON_SELECTORS = ["button:has(use[href='#icon_plus'])"]
 _FIND_BY_NUMBER_ITEM_MENU_SELECTORS = ["[role='menuitem']:has-text('Найти по номеру')", "[role='menuitem']:has-text('Search by number')"]
 _CONTACT_NUMBER_INPUT_SELECTORS = ["form[id='findContact'] input"]
-_FIND_CONTACT_SUBMIT_SELECTORS = ["button[aria-label*='Найти в MAX']", "button[aria-label*='Find in MAX']"]
+_FIND_CONTACT_SUBMIT_SELECTORS = [
+    "button[type='submit'][form='findContact']",
+    "form#findContact ~ * button[type='submit']",
+    "form#findContact button[type='submit']",
+]
 _MESSAGE_INPUT_SELECTORS = [
     "div[contenteditable='true'][role='textbox']",
     "div[contenteditable='true'][data-testid*='composer']",
@@ -151,15 +155,28 @@ class MaxBrowserManager:
             return context
 
     async def _block_heavy_resources(self, context: BrowserContext) -> None:
-        blocked_resource_types = {"image", "media", "font"}
-        blocked_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".mp4", ".webm"}
+        blocked_resource_types = {"media", "font"}
+        blocked_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".webm"}
+        allowed_image_hosts = {"web.max.ru", "st.max.ru"}
 
         async def route_handler(route):
             request = route.request
+            url = request.url.lower()
+            # Allow inline assets (emojis, sprites) served from MAX CDN
+            try:
+                host = request.url.split("//", 1)[1].split("/", 1)[0].split(":", 1)[0]
+                if request.resource_type == "image" and host in allowed_image_hosts:
+                    await route.continue_()
+                    return
+            except Exception:
+                pass
             if request.resource_type in blocked_resource_types:
                 await route.abort()
                 return
-            url = request.url.lower()
+            if request.resource_type == "image":
+                # Still block third-party images (ads, tracking, heavy avatars from outside MAX)
+                await route.abort()
+                return
             if any(ext in url for ext in blocked_extensions):
                 await route.abort()
                 return
@@ -168,13 +185,46 @@ class MaxBrowserManager:
         await context.route("**/*", route_handler)
 
     async def _wait_and_get_first(self, page: Page, selectors: Iterable[str], timeout_ms: int = 7000) -> Optional[str]:
-        for selector in selectors:
+        for sel in selectors:
+            selector = sel
+            # Playwright wait_for_selector accepts CSS by default. Auto-prefix xpath= for
+            # XPath-style selectors (//...) so callers don't need to remember to add it.
+            if selector.startswith("//") or selector.startswith(".//"):
+                selector = "xpath=" + selector
             try:
                 await page.wait_for_selector(selector, timeout=timeout_ms)
-                return selector
+                return sel
             except PlaywrightTimeoutError:
                 continue
         return None
+
+    async def _diag_snapshot(self, page: Page, prefix: str) -> None:
+        """Best-effort diagnostic snapshot for debugging selector wait failures."""
+        try:
+            url = page.url
+            title = await page.title()
+            buttons = await page.locator("button").count()
+            uses = await page.locator("use").count()
+            hrefs = await page.evaluate(
+                "() => [...new Set([...document.querySelectorAll('use')].map(u => u.getAttribute('href') || u.getAttribute('xlink:href') || ''))].slice(0, 20)"
+            )
+            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+            screenshot_path = f"/tmp/diag_{prefix}_{ts}.png"
+            html_path = f"/tmp/diag_{prefix}_{ts}.html"
+            try:
+                await page.screenshot(path=screenshot_path, full_page=True)
+            except Exception as se:
+                screenshot_path = f"<screenshot-failed:{se}>"
+            try:
+                Path(html_path).write_text(await page.content(), encoding="utf-8")
+            except Exception as he:
+                html_path = f"<html-failed:{he}>"
+            logger.error(
+                f"[DIAG:{prefix}] url={url} title={title!r} buttons={buttons} uses={uses} hrefs={hrefs} "
+                f"screenshot={screenshot_path} html={html_path}"
+            )
+        except Exception as e:
+            logger.exception(f"[DIAG:{prefix}] snapshot collection failed: {e}")
 
     async def _open_chat_by_phone(self, page: Page, phone: str) -> bool:
         logger.info(f"Opening chat for phone: {phone}")
@@ -183,35 +233,31 @@ class MaxBrowserManager:
             back_selector = await self._wait_and_get_first(page, _BACK_BUTTON_SELECTORS, timeout_ms=2000)
             if back_selector:
                 await page.click(back_selector)
-                await page.wait_for_timeout(600)
+                await self._wait_and_get_first(page, _SEARCH_PLUS_BUTTON_SELECTORS, timeout_ms=2000)
 
-        open_selector = await self._wait_and_get_first(page, _SEARCH_PLUS_BUTTON_SELECTORS, timeout_ms=5000)
+        open_selector = await self._wait_and_get_first(page, _SEARCH_PLUS_BUTTON_SELECTORS, timeout_ms=10000)
         if not open_selector:
+            await self._diag_snapshot(page, "plus_button_missing")
             raise MaxMessengerError("Button 'Начать общение' not found.")
         await page.click(open_selector)
-        await page.wait_for_timeout(700)
 
         find_by_number_selector = await self._wait_and_get_first(page, _FIND_BY_NUMBER_ITEM_MENU_SELECTORS, timeout_ms=5000)
         if not find_by_number_selector:
             raise MaxMessengerError("Menu item 'Найти по номеру' not found.")
         await page.click(find_by_number_selector)
-        await page.wait_for_timeout(600)
 
         phone_input_selector = await self._wait_and_get_first(page, _CONTACT_NUMBER_INPUT_SELECTORS, timeout_ms=8000)
         if not phone_input_selector:
             raise MaxMessengerError("Phone input not found.")
 
-        await page.click(phone_input_selector)
-        await page.fill(phone_input_selector, "")
-        await page.type(phone_input_selector, phone, delay=30)
-        await page.wait_for_timeout(250)
+        await page.fill(phone_input_selector, phone)
 
         submit_selector = await self._wait_and_get_first(page, _FIND_CONTACT_SUBMIT_SELECTORS, timeout_ms=8000)
         if not submit_selector:
             raise MaxMessengerError("Submit button 'Найти в MAX' not found.")
         await page.click(submit_selector)
-        
-        # Long wait for chat to open
+
+        # Auto-wait for chat to open (no arbitrary sleep buffers)
         chat_found = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=10000)
         return bool(chat_found)
 
@@ -220,7 +266,6 @@ class MaxBrowserManager:
         page = await context.new_page()
         try:
             await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1000)
 
             if not await self._open_chat_by_phone(page, phone):
                 return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Chat not opened")
@@ -232,7 +277,19 @@ class MaxBrowserManager:
             await page.click(message_selector)
             await page.fill(message_selector, text)
             await page.keyboard.press("Enter")
-            await page.wait_for_timeout(1500)
+            # Auto-wait: confirm the outgoing bubble landed in history before returning success
+            try:
+                await page.wait_for_function(
+                    """() => {
+                        const wrappers = document.querySelectorAll('div[class*="messageWrapper"]');
+                        if (!wrappers.length) return false;
+                        const last = wrappers[wrappers.length - 1];
+                        return (last.className || '').includes('messageWrapper--isOut');
+                    }""",
+                    timeout=5000,
+                )
+            except PlaywrightTimeoutError:
+                pass
 
             return SendMaxMessageResult(sent_ok=True, status_note="delivered")
         except Exception as e:
@@ -246,7 +303,6 @@ class MaxBrowserManager:
         page = await context.new_page()
         try:
             await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
-            await page.wait_for_timeout(1000)
 
             if not await self._open_chat_by_phone(page, phone):
                 return CheckMaxMessageResult(reply_value="", check_ok=False)
