@@ -9,7 +9,6 @@ from typing import List, Optional
 import aio_pika
 import httpx
 from pydantic import BaseModel, Field
-#--mode mx-check --xls Klienty_301.xls
 from max_playwright_sender import (
     MaxBrowserManager,
     logger,
@@ -106,31 +105,29 @@ class MaxWorkerDaemon:
 
     async def process_notify_task(self, message: aio_pika.IncomingMessage):
         try:
-            body = json.loads(message.body.decode())
-            task = TenantAdminNotificationTask(**body)
-            logger.info(f"Processing notify task for tenant: {task.tenant_phone} with {len(task.replies)} replies")
+            async with message.process():
+                body = json.loads(message.body.decode())
+                task = TenantAdminNotificationTask(**body)
+                logger.info(f"Processing notify task for tenant: {task.tenant_phone} with {len(task.replies)} replies")
 
-            phone = normalize_phone_for_max(task.tenant_phone)
-            if not phone:
-                logger.error(f"Invalid tenant phone format: {task.tenant_phone}")
-                await message.ack()
-                return
+                phone = normalize_phone_for_max(task.tenant_phone)
+                if not phone:
+                    logger.error(f"Invalid tenant phone format: {task.tenant_phone}")
+                    return
 
-            # Build message
-            notification_text = self.format_notification_message(task)
-            logger.info(f"Notification text:\n{notification_text}")
+                # Build message
+                notification_text = self.format_notification_message(task)
+                logger.info(f"Notification text:\n{notification_text}")
 
-            # Send message
-            result = await self.browser_manager.send_message(phone, notification_text)
-            if result.status_note == "success":
-                logger.info(f"Notification sent successfully to {task.tenant_phone}")
-            else:
-                logger.error(f"Failed to send notification: {result.error_message}")
-
-            await message.ack()
+                # Send message
+                result = await self.browser_manager.send_message(phone, notification_text)
+                if result.sent_ok:
+                    logger.info(f"Notification sent successfully to {task.tenant_phone}")
+                else:
+                    logger.error(f"Failed to send notification: {result.error_message}")
         except Exception as e:
             logger.exception("Error in process_notify_task")
-            await message.nack(requeue=True)  # Requeue on failure
+            # Don't requeue, just log for now (but in real life, maybe requeue with backoff)
 
     async def process_send_task(self, message: aio_pika.IncomingMessage):
         async with message.process():
@@ -149,13 +146,21 @@ class MaxWorkerDaemon:
                     return
 
                 result = await self.browser_manager.send_message(phone, task.message_text)
+                await self.send_callback(CallbackPayload(
+                    task_id=task.task_id,
+                    status=result.status_note,
+                    error_message=result.error_message
+                ))
 
-
-                #await self.send_callback(CallbackPayload(
-                #    task_id=task.task_id,
-                #    status=result.status_note,
-                #    error_message=result.error_message
-                #))
+                # Now, also publish to RESULTS_QUEUE with "sent" status!
+                if result.sent_ok:
+                    await self.publish_result(TargetResult(
+                        target_id=task.task_id,
+                        campaign_id=task.campaign_id,
+                        phone_number=task.phone,
+                        status="sent",
+                        timestamp=datetime.utcnow().isoformat() + "Z"
+                    ))
 
             except Exception as e:
                 logger.exception("Error in process_send_task")
@@ -189,10 +194,19 @@ class MaxWorkerDaemon:
                             phone_number=target.phone_normalized,
                             status="replied",
                             reply_text=result.reply_value,
-                            timestamp=result.replied_at or (datetime.utcnow().isoformat() + "Z")
+                            timestamp=result.replied_at or datetime.utcnow().isoformat() + "Z"
+                        )
+                    elif result.is_viewed:
+                        # Message is viewed
+                        target_result = TargetResult(
+                            target_id=target.target_id,
+                            campaign_id=task.campaign_id,
+                            phone_number=target.phone_normalized,
+                            status="viewed",
+                            timestamp=datetime.utcnow().isoformat() + "Z"
                         )
                     else:
-                        # No reply yet
+                        # No reply yet, just delivered
                         target_result = TargetResult(
                             target_id=target.target_id,
                             campaign_id=task.campaign_id,
@@ -241,4 +255,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(daemon.run())
     except KeyboardInterrupt:
-        logger.info("Stopped by user")
+        logger.info("Received keyboard interrupt, exiting...")
+    except Exception as e:
+        logger.exception("Unhandled exception in main")

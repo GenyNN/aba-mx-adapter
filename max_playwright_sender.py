@@ -56,6 +56,7 @@ class CheckMaxMessageResult:
     reply_value: str
     check_ok: bool = True
     replied_at: Optional[str] = None
+    is_viewed: bool = False
 
 # --- Selectors ---
 _SEARCH_PLUS_BUTTON_SELECTORS = ["button:has(use[href='#icon_plus_mini'])"]
@@ -229,7 +230,7 @@ class MaxBrowserManager:
                 return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
             await page.click(message_selector)
-            await page.type(message_selector, text, delay=35)
+            await page.fill(message_selector, text)
             await page.keyboard.press("Enter")
             await page.wait_for_timeout(1500)
 
@@ -259,6 +260,20 @@ class MaxBrowserManager:
             variant = (payload.get("variant") or "").strip().casefold()
             is_out = bool(payload.get("isOut"))
             text = str(payload.get("text") or "").strip()
+            status_icon = str(payload.get("statusIcon") or "")
+            
+            logger.info(f"Debug: is_out={is_out}, variant={variant}, statusIcon={status_icon}")
+            
+            is_viewed = False
+            # Check if last outgoing message is viewed (common selectors for Max: check-double, read, viewed, seen in status icon
+            status_icon_lower = status_icon.lower()
+            if is_out and (
+                "check-double" in status_icon_lower or
+                "read" in status_icon_lower or
+                "viewed" in status_icon_lower or
+                "seen" in status_icon_lower
+            ):
+                is_viewed = True
             
             # If last message is incoming (from client)
             if variant == "incoming" or not is_out:
@@ -268,7 +283,7 @@ class MaxBrowserManager:
                     replied_at=datetime.utcnow().isoformat() + "Z"
                 )
             
-            return CheckMaxMessageResult(reply_value="", check_ok=True)
+            return CheckMaxMessageResult(reply_value="", check_ok=True, is_viewed=is_viewed)
         except Exception as e:
             logger.exception(f"Error checking reply for {phone}")
             return CheckMaxMessageResult(reply_value="", check_ok=False)
