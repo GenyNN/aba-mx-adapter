@@ -317,9 +317,9 @@ class MaxBrowserManager:
             is_out = bool(payload.get("isOut"))
             text = str(payload.get("text") or "").strip()
             status_icon = str(payload.get("statusIcon") or "")
-            
+
             logger.info(f"Debug: is_out={is_out}, variant={variant}, statusIcon={status_icon}")
-            
+
             is_viewed = False
             # Check if last outgoing message is viewed (common selectors for Max: check-double, read, viewed, seen in status icon
             status_icon_lower = status_icon.lower()
