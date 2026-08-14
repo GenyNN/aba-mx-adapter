@@ -22,6 +22,7 @@ QUEUE_SEND = "tasks.messages.send"
 QUEUE_POLL = "tasks.messages.poll_replies"
 QUEUE_RESULTS = "tasks.messages.results_replies_queue"
 QUEUE_NOTIFY = "tasks.messages.tenant_admin_notify"
+_NOTIFICATION_PREFIX = "🔔 New responses received:"
 
 # --- Models ---
 class SendTask(BaseModel):
@@ -52,6 +53,7 @@ class TargetResult(BaseModel):
     status: str
     reply_text: Optional[str] = None
     timestamp: str
+    chat_id: Optional[str] = None
 
 class ClientReplyInfo(BaseModel):
     user_phone: str
@@ -71,6 +73,7 @@ class MaxWorkerDaemon:
         self.http_client = httpx.AsyncClient(base_url=ORCHESTRATOR_URL, timeout=30.0)
         self.publish_channel: Optional[aio_pika.Channel] = None
         self.publish_connection: Optional[aio_pika.Connection] = None
+        self._ws_forwarder_task: Optional[asyncio.Task] = None
 
     async def send_callback(self, payload: CallbackPayload):
         try:
@@ -85,7 +88,7 @@ class MaxWorkerDaemon:
             if not self.publish_channel:
                 return
             
-            body = result.model_dump_json().encode()
+            body = result.model_dump_json(exclude_none=True).encode()
             await self.publish_channel.default_exchange.publish(
                 aio_pika.Message(body=body, content_type="application/json"),
                 routing_key=QUEUE_RESULTS
@@ -93,6 +96,38 @@ class MaxWorkerDaemon:
             logger.info(f"Published result for target {result.target_id}")
         except Exception as e:
             logger.error(f"Failed to publish result: {e}")
+
+    async def publish_payload(self, payload: dict):
+        try:
+            if not self.publish_channel:
+                return
+            body = json.dumps(payload, ensure_ascii=False).encode()
+            await self.publish_channel.default_exchange.publish(
+                aio_pika.Message(body=body, content_type="application/json"),
+                routing_key=QUEUE_RESULTS
+            )
+        except Exception as e:
+            logger.error(f"Failed to publish payload: {e}")
+
+    async def forward_ws_events(self):
+        while True:
+            event = await self.browser_manager.next_ws_action()
+            status = str(event.get("status") or "")
+            chat_id = str(event.get("chat_id") or "")
+            if not status or not chat_id:
+                continue
+            payload = {
+                "status": status,
+                "chat_id": chat_id,
+                "timestamp": str(event.get("timestamp") or datetime.utcnow().isoformat() + "Z"),
+            }
+            reply_text = event.get("reply_text")
+            if isinstance(reply_text, str) and reply_text.strip():
+                if reply_text.startswith(_NOTIFICATION_PREFIX):
+                    continue
+                payload["reply_text"] = reply_text
+            await self.publish_payload(payload)
+            logger.info(f"Forwarded WS event: status={status} chat_id={chat_id}")
 
     def format_notification_message(self, task: TenantAdminNotificationTask) -> str:
         lines = ["🔔 New responses received:"]
@@ -154,12 +189,15 @@ class MaxWorkerDaemon:
 
                 # Now, also publish to RESULTS_QUEUE with "sent" status!
                 if result.sent_ok:
+                    if not result.chat_id:
+                        logger.error(f"Send succeeded but chat_id not captured for target {task.task_id} phone={phone}")
                     await self.publish_result(TargetResult(
                         target_id=task.task_id,
                         campaign_id=task.campaign_id,
-                        phone_number=task.phone,
+                        phone_number=phone,
                         status="sent",
-                        timestamp=datetime.utcnow().isoformat() + "Z"
+                        timestamp=datetime.utcnow().isoformat() + "Z",
+                        chat_id=result.chat_id
                     ))
 
             except Exception as e:
@@ -244,9 +282,18 @@ class MaxWorkerDaemon:
                 await poll_queue.consume(self.process_poll_task)
                 await notify_queue.consume(self.process_notify_task)
 
+                self._ws_forwarder_task = asyncio.create_task(self.forward_ws_events())
+
                 # Keep running
                 await asyncio.Future()
         finally:
+            if self._ws_forwarder_task:
+                self._ws_forwarder_task.cancel()
+                try:
+                    await self._ws_forwarder_task
+                except asyncio.CancelledError:
+                    pass
+                self._ws_forwarder_task = None
             await self.browser_manager.stop()
             await self.http_client.aclose()
 
