@@ -1,12 +1,13 @@
 import asyncio
 import base64
+from collections import OrderedDict
 import json
 import logging
 import re
 import struct
 import sys
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
@@ -43,6 +44,9 @@ DEFAULT_SESSION_FILE = "max_auth.json"
 DEFAULT_BASE_URL = "https://web.max.ru"
 DEFAULT_RESTART_INTERVAL_SECONDS = 60 * 60
 _NOTIFICATION_PREFIX = "🔔 New responses received:"
+_PHONE_CHAT_CACHE_MAX_SIZE = 5000
+_DIAG_DUMP_MAX_FILES = 20
+_DIAG_DUMP_MAX_AGE = timedelta(hours=24)
 
 class MaxMessengerError(RuntimeError):
     """Base error for Max messenger automation."""
@@ -133,11 +137,10 @@ class MaxBrowserManager:
         self._restart_task: Optional[asyncio.Task] = None
         self._listener_context: Optional[BrowserContext] = None
         self._listener_page: Optional[Page] = None
-        self._ws_events: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._ws_actions: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._viewer_id: Optional[int] = self._load_viewer_id()
-        self._chat_by_phone: Dict[str, str] = {}
-        self._phone_by_chat_id: Dict[str, str] = {}
+        self._chat_by_phone: "OrderedDict[str, str]" = OrderedDict()
+        self._phone_by_chat_id: "OrderedDict[str, str]" = OrderedDict()
         self._chat_status: Dict[str, Dict[str, Any]] = {}
 
     async def start(self):
@@ -211,6 +214,7 @@ class MaxBrowserManager:
 
     async def _restart_browser(self, reason: str):
         logger.info(f"Restarting browser. reason={reason}")
+        self._chat_status.clear()
         await self._close_listener()
         await self._close_browser_only()
         await self._start_browser_only()
@@ -298,8 +302,7 @@ class MaxBrowserManager:
                     return
                 chat_id_str = str(chat_id)
                 if phone_for_mapping and chat_id_str and phone_for_mapping not in self._chat_by_phone:
-                    self._chat_by_phone[phone_for_mapping] = chat_id_str
-                    self._phone_by_chat_id[chat_id_str] = phone_for_mapping
+                    self._cache_phone_chat(phone=phone_for_mapping, chat_id=chat_id_str)
             except Exception:
                 return
 
@@ -314,15 +317,6 @@ class MaxBrowserManager:
             opcode = int(data.get("opcode") or 0)
             direction = str(data.get("dir") or "")
             if opcode == 1:
-                await self._push_ws_event(
-                    {
-                        "dir": direction,
-                        "opcode": 1,
-                        "payload": data.get("payload"),
-                        "wsUrl": data.get("url"),
-                        "ts": data.get("ts"),
-                    }
-                )
                 return
             if opcode != 2:
                 return
@@ -339,15 +333,6 @@ class MaxBrowserManager:
         except Exception as e:
             logger.error(f"WS sniffer emit handler failed: {e}")
 
-    async def _push_ws_event(self, event: Dict[str, Any]):
-        try:
-            self._ws_events.put_nowait(event)
-        except asyncio.QueueFull:
-            try:
-                _ = self._ws_events.get_nowait()
-            except Exception:
-                return
-
     async def _push_ws_action(self, event: Dict[str, Any]):
         try:
             self._ws_actions.put_nowait(event)
@@ -362,17 +347,6 @@ class MaxBrowserManager:
                 return
 
     async def _handle_max_protocol_event(self, direction: str, decoded: Dict[str, Any]):
-        await self._push_ws_event(
-            {
-                "dir": direction,
-                "cmd": decoded.get("cmd"),
-                "seq": decoded.get("seq"),
-                "opcode": decoded.get("opcode"),
-                "payload": decoded.get("payload"),
-                "ts": datetime.utcnow().isoformat() + "Z",
-            }
-        )
-
         opcode = decoded.get("opcode")
         payload = decoded.get("payload")
         if not isinstance(payload, dict):
@@ -547,8 +521,32 @@ class MaxBrowserManager:
                 f"[DIAG:{prefix}] url={url} title={title!r} buttons={buttons} uses={uses} hrefs={hrefs} "
                 f"screenshot={screenshot_path} html={html_path}"
             )
+            self._cleanup_diag_dumps(prefix=prefix)
         except Exception as e:
             logger.exception(f"[DIAG:{prefix}] snapshot collection failed: {e}")
+
+    def _cleanup_diag_dumps(self, prefix: str) -> None:
+        try:
+            now = datetime.utcnow()
+            candidates = list(Path("/tmp").glob("diag_*.*"))
+            keep: List[Path] = []
+            for p in candidates:
+                try:
+                    mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
+                except Exception:
+                    continue
+                if now - mtime <= _DIAG_DUMP_MAX_AGE:
+                    keep.append(p)
+            keep.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+            to_delete = keep[_DIAG_DUMP_MAX_FILES:]
+            old_to_delete = [p for p in candidates if p not in keep]
+            for p in to_delete + old_to_delete:
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            return
 
     async def _open_chat_by_phone(self, page: Page, phone: str) -> bool:
         logger.info(f"Opening chat for phone: {phone}")
@@ -586,102 +584,113 @@ class MaxBrowserManager:
         return bool(chat_found)
 
     async def send_message(self, phone: str, text: str, base_url: str = DEFAULT_BASE_URL) -> SendMaxMessageResult:
-        context = await self.get_context()
-        page = await context.new_page()
         try:
-            await self._attach_ws_sniffer_to_page(page, phone_for_mapping=phone)
-            await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
-
-            if not await self._open_chat_by_phone(page, phone):
-                return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Chat not opened")
-            await self._maybe_capture_chat_id(page, phone)
-            if phone not in self._chat_by_phone:
-                await self._wait_for_chat_id(phone, timeout_seconds=5.0)
-
-            message_selector = await self._wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=3000)
-            if not message_selector:
-                return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
-
-            await page.click(message_selector)
-            await page.fill(message_selector, text)
-            await page.keyboard.press("Enter")
-            # Auto-wait: confirm the outgoing bubble landed in history before returning success
+            context = await self.get_context()
             try:
-                await page.wait_for_function(
-                    """() => {
-                        const wrappers = document.querySelectorAll('div[class*="messageWrapper"]');
-                        if (!wrappers.length) return false;
-                        const last = wrappers[wrappers.length - 1];
-                        return (last.className || '').includes('messageWrapper--isOut');
-                    }""",
-                    timeout=5000,
-                )
-            except PlaywrightTimeoutError:
-                pass
+                page = await context.new_page()
+                try:
+                    await self._attach_ws_sniffer_to_page(page, phone_for_mapping=phone)
+                    await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
-            return SendMaxMessageResult(
-                sent_ok=True,
-                status_note="delivered",
-                chat_id=self._chat_by_phone.get(phone),
-            )
+                    if not await self._open_chat_by_phone(page, phone):
+                        return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Chat not opened")
+                    await self._maybe_capture_chat_id(page, phone)
+                    if phone not in self._chat_by_phone:
+                        await self._wait_for_chat_id(phone, timeout_seconds=5.0)
+
+                    message_selector = await self._wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=3000)
+                    if not message_selector:
+                        return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
+
+                    await page.click(message_selector)
+                    await page.fill(message_selector, text)
+                    await page.keyboard.press("Enter")
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                const wrappers = document.querySelectorAll('div[class*="messageWrapper"]');
+                                if (!wrappers.length) return false;
+                                const last = wrappers[wrappers.length - 1];
+                                return (last.className || '').includes('messageWrapper--isOut');
+                            }""",
+                            timeout=5000,
+                        )
+                    except PlaywrightTimeoutError:
+                        pass
+
+                    return SendMaxMessageResult(
+                        sent_ok=True,
+                        status_note="delivered",
+                        chat_id=self._chat_by_phone.get(phone),
+                    )
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            finally:
+                await context.close()
         except Exception as e:
             logger.exception(f"Error sending message to {phone}")
             return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
-        finally:
-            await context.close()
 
     async def check_reply(self, phone: str, base_url: str = DEFAULT_BASE_URL) -> CheckMaxMessageResult:
         cached = self._get_cached_check_reply(phone)
         if cached:
             return cached
-        context = await self.get_context()
-        page = await context.new_page()
         try:
-            await self._attach_ws_sniffer_to_page(page, phone_for_mapping=None)
-            await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+            context = await self.get_context()
+            try:
+                page = await context.new_page()
+                try:
+                    await self._attach_ws_sniffer_to_page(page, phone_for_mapping=None)
+                    await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
-            if not await self._open_chat_by_phone(page, phone):
-                return CheckMaxMessageResult(reply_value="", check_ok=False)
-            await self._maybe_capture_chat_id(page, phone)
+                    if not await self._open_chat_by_phone(page, phone):
+                        return CheckMaxMessageResult(reply_value="", check_ok=False)
+                    await self._maybe_capture_chat_id(page, phone)
 
-            await self._wait_and_get_first(page, _CHAT_HISTORY_SELECTORS, timeout_ms=8000)
-            payload = await page.evaluate(_PARSE_LAST_MESSAGE_JS)
-            
-            if payload.get("error"):
-                return CheckMaxMessageResult(reply_value="", check_ok=False)
+                    await self._wait_and_get_first(page, _CHAT_HISTORY_SELECTORS, timeout_ms=8000)
+                    payload = await page.evaluate(_PARSE_LAST_MESSAGE_JS)
+                    
+                    if payload.get("error"):
+                        return CheckMaxMessageResult(reply_value="", check_ok=False)
 
-            variant = (payload.get("variant") or "").strip().casefold()
-            is_out = bool(payload.get("isOut"))
-            text = str(payload.get("text") or "").strip()
-            status_icon = str(payload.get("statusIcon") or "")
+                    variant = (payload.get("variant") or "").strip().casefold()
+                    is_out = bool(payload.get("isOut"))
+                    text = str(payload.get("text") or "").strip()
+                    status_icon = str(payload.get("statusIcon") or "")
 
-            logger.info(f"Debug: is_out={is_out}, variant={variant}, statusIcon={status_icon}")
+                    logger.info(f"Debug: is_out={is_out}, variant={variant}, statusIcon={status_icon}")
 
-            is_viewed = False
-            # Check if last outgoing message is viewed (common selectors for Max: check-double, read, viewed, seen in status icon
-            status_icon_lower = status_icon.lower()
-            if is_out and (
-                "check-double" in status_icon_lower or
-                "read" in status_icon_lower or
-                "viewed" in status_icon_lower or
-                "seen" in status_icon_lower
-            ):
-                is_viewed = True
-            
-            # If last message is incoming (from client)
-            if variant == "incoming" or not is_out:
-                return CheckMaxMessageResult(
-                    reply_value=text, 
-                    check_ok=True, 
-                    replied_at=datetime.utcnow().isoformat() + "Z"
-                )
-            
-            return CheckMaxMessageResult(reply_value="", check_ok=True, is_viewed=is_viewed)
+                    is_viewed = False
+                    status_icon_lower = status_icon.lower()
+                    if is_out and (
+                        "check-double" in status_icon_lower or
+                        "read" in status_icon_lower or
+                        "viewed" in status_icon_lower or
+                        "seen" in status_icon_lower
+                    ):
+                        is_viewed = True
+                    
+                    if variant == "incoming" or not is_out:
+                        return CheckMaxMessageResult(
+                            reply_value=text, 
+                            check_ok=True, 
+                            replied_at=datetime.utcnow().isoformat() + "Z"
+                        )
+                    
+                    return CheckMaxMessageResult(reply_value="", check_ok=True, is_viewed=is_viewed)
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+            finally:
+                await context.close()
         except Exception as e:
             logger.exception(f"Error checking reply for {phone}")
             return CheckMaxMessageResult(reply_value="", check_ok=False)
-        finally:
-            await context.close()
 
     async def _maybe_capture_chat_id(self, page: Page, phone: str) -> None:
         chat_id = _extract_chat_id_from_url(page.url)
@@ -721,8 +730,26 @@ class MaxBrowserManager:
         if not chat_id:
             return
         chat_id_str = str(chat_id)
-        self._chat_by_phone[phone] = chat_id_str
-        self._phone_by_chat_id[chat_id_str] = phone
+        self._cache_phone_chat(phone=phone, chat_id=chat_id_str)
+
+    def _cache_phone_chat(self, phone: str, chat_id: str) -> None:
+        try:
+            self._chat_by_phone[phone] = chat_id
+            self._chat_by_phone.move_to_end(phone)
+            self._phone_by_chat_id[chat_id] = phone
+            self._phone_by_chat_id.move_to_end(chat_id)
+
+            while len(self._chat_by_phone) > _PHONE_CHAT_CACHE_MAX_SIZE:
+                old_phone, old_chat = self._chat_by_phone.popitem(last=False)
+                if self._phone_by_chat_id.get(old_chat) == old_phone:
+                    self._phone_by_chat_id.pop(old_chat, None)
+
+            while len(self._phone_by_chat_id) > _PHONE_CHAT_CACHE_MAX_SIZE:
+                old_chat, old_phone = self._phone_by_chat_id.popitem(last=False)
+                if self._chat_by_phone.get(old_phone) == old_chat:
+                    self._chat_by_phone.pop(old_phone, None)
+        except Exception:
+            return
 
     async def _wait_for_chat_id(self, phone: str, timeout_seconds: float) -> Optional[str]:
         deadline = asyncio.get_event_loop().time() + timeout_seconds
