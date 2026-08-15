@@ -14,6 +14,7 @@ from max_playwright_sender import (
     logger,
     normalize_phone_for_max,
 )
+from media_cache_manager import MediaCacheManager
 
 # --- Configuration ---
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
@@ -31,6 +32,8 @@ class SendTask(BaseModel):
     messenger: str
     phone: str
     message_text: str
+    attachment_url: Optional[str] = None
+    attachment_name: Optional[str] = None
 
 class CallbackPayload(BaseModel):
     task_id: str
@@ -71,6 +74,8 @@ class MaxWorkerDaemon:
     def __init__(self):
         self.browser_manager = MaxBrowserManager(headless=False)
         self.http_client = httpx.AsyncClient(base_url=ORCHESTRATOR_URL, timeout=30.0)
+        self.media_http_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+        self.media_cache = MediaCacheManager(cache_dir="media_cache", http_client=self.media_http_client)
         self.publish_channel: Optional[aio_pika.Channel] = None
         self.publish_connection: Optional[aio_pika.Connection] = None
         self._ws_forwarder_task: Optional[asyncio.Task] = None
@@ -165,11 +170,13 @@ class MaxWorkerDaemon:
             # Don't requeue, just log for now (but in real life, maybe requeue with backoff)
 
     async def process_send_task(self, message: aio_pika.IncomingMessage):
-        async with message.process():
+        raw_body = message.body.decode("utf-8", errors="replace")
+        logger.info(f"Received payload: {raw_body}")
+        async with message.process(requeue=False):
             try:
-                body = json.loads(message.body.decode())
+                body = json.loads(raw_body)
                 task = SendTask(**body)
-                logger.info(f"Processing send task: {task.task_id} for {task.phone}")
+                logger.info(f"Processing send task: {task.task_id} for {task.phone} (attachment_url={task.attachment_url!r}, attachment_name={task.attachment_name!r})")
 
                 phone = normalize_phone_for_max(task.phone)
                 if not phone:
@@ -180,7 +187,22 @@ class MaxWorkerDaemon:
                     ))
                     return
 
-                result = await self.browser_manager.send_message(phone, task.message_text)
+                attachment_path: Optional[str] = None
+                try:
+                    attachment_path = await self.media_cache.ensure_campaign_media(
+                        campaign_id=task.campaign_id,
+                        attachment_url=task.attachment_url,
+                        attachment_name=task.attachment_name,
+                    )
+                except Exception as e:
+                    await self.send_callback(CallbackPayload(
+                        task_id=task.task_id,
+                        status="failed",
+                        error_message=f"Attachment download failed: {e}"
+                    ))
+                    return
+
+                result = await self.browser_manager.send_message(phone, task.message_text, attachment_path=attachment_path)
                 await self.send_callback(CallbackPayload(
                     task_id=task.task_id,
                     status=result.status_note,
@@ -202,6 +224,21 @@ class MaxWorkerDaemon:
 
             except Exception as e:
                 logger.exception("Error in process_send_task")
+                # Try to extract a task_id so we can report a failure callback.
+                try:
+                    body = json.loads(raw_body)
+                    task_id = body.get("task_id")
+                except Exception:
+                    task_id = None
+                if task_id:
+                    try:
+                        await self.send_callback(CallbackPayload(
+                            task_id=task_id,
+                            status="failed",
+                            error_message=f"worker exception: {e}",
+                        ))
+                    except Exception as cb_err:
+                        logger.error(f"Failed to send failure callback: {cb_err}")
 
     async def process_poll_task(self, message: aio_pika.IncomingMessage):
         async with message.process():

@@ -3,6 +3,7 @@ import base64
 from collections import OrderedDict
 import json
 import logging
+import os
 import re
 import struct
 import sys
@@ -83,6 +84,23 @@ _MESSAGE_INPUT_SELECTORS = [
     "textarea[placeholder*='Сообщение']",
     "textarea[placeholder*='Message']",
     "div[placeholder*='Message']"
+]
+_ATTACH_BUTTON_SELECTORS = [
+    "button:has(use[href*='paperclip'])",
+    "button:has(use[href*='attach'])",
+    "button[aria-label*='Прикреп']",
+    "button[aria-label*='Attach']",
+]
+_ATTACH_MENU_FILE_SELECTORS = [
+    "[role='menuitem']:has-text('Файл')",
+    "[role='menuitem']:has-text('Документ')",
+    "[role='menuitem']:has-text('File')",
+    "[role='menuitem']:has-text('Document')",
+]
+_ATTACHMENT_PREVIEW_SELECTORS = [
+    "[class*='attachment']",
+    "[data-testid*='attachment']",
+    "a[href][download]",
 ]
 #"div[placeholder*='Messagne'
 _OPENED_CHAT_SELECTORS = [".openedChat", "[class*='openedChat']"]
@@ -583,7 +601,28 @@ class MaxBrowserManager:
         chat_found = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=10000)
         return bool(chat_found)
 
-    async def send_message(self, phone: str, text: str, base_url: str = DEFAULT_BASE_URL) -> SendMaxMessageResult:
+    async def _attach_file_to_chat(self, page: Page, attachment_path: Union[str, Path]) -> None:
+        path = Path(attachment_path)
+        if not path.exists():
+            raise MaxMessengerError("Attachment file not found")
+
+        attach_selector = await self._wait_and_get_first(page, _ATTACH_BUTTON_SELECTORS, timeout_ms=8000)
+        if not attach_selector:
+            await self._diag_snapshot(page, "attach_button_missing")
+            raise MaxMessengerError("Attach button not found")
+
+        async with page.expect_file_chooser(timeout=15000) as fc_info:
+            await page.click(attach_selector)
+            menu_selector = await self._wait_and_get_first(page, _ATTACH_MENU_FILE_SELECTORS, timeout_ms=1500)
+            if menu_selector:
+                await page.click(menu_selector)
+
+        chooser = await fc_info.value
+        await chooser.set_files(str(path))
+
+        await self._wait_and_get_first(page, _ATTACHMENT_PREVIEW_SELECTORS, timeout_ms=15000)
+
+    async def send_message(self, phone: str, text: str, attachment_path: Optional[Union[str, Path]] = None, base_url: str = DEFAULT_BASE_URL) -> SendMaxMessageResult:
         try:
             context = await self.get_context()
             try:
@@ -603,6 +642,11 @@ class MaxBrowserManager:
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
                     await page.click(message_selector)
+                    if attachment_path:
+                        try:
+                            await self._attach_file_to_chat(page, attachment_path)
+                        except Exception as e:
+                            return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
                     await page.fill(message_selector, text)
                     await page.keyboard.press("Enter")
                     try:
