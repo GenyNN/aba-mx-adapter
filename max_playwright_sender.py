@@ -4,6 +4,7 @@ from collections import OrderedDict
 import json
 import logging
 import os
+import random
 import re
 import struct
 import sys
@@ -44,7 +45,7 @@ logger.addHandler(handler)
 DEFAULT_SESSION_FILE = "max_auth.json"
 DEFAULT_BASE_URL = "https://web.max.ru"
 DEFAULT_RESTART_INTERVAL_SECONDS = 60 * 60
-_NOTIFICATION_PREFIX = "🔔 New responses received:"
+_NOTIFICATION_PREFIX = "🔔 Получены новые сообщения:"
 _PHONE_CHAT_CACHE_MAX_SIZE = 5000
 _DIAG_DUMP_MAX_FILES = 20
 _DIAG_DUMP_MAX_AGE = timedelta(hours=24)
@@ -106,6 +107,13 @@ _ATTACHMENT_PREVIEW_SELECTORS = [
 _OPENED_CHAT_SELECTORS = [".openedChat", "[class*='openedChat']"]
 _CHAT_HISTORY_SELECTORS = [".openedChat .history", "[class*='openedChat'] [class*='history']"]
 _BACK_BUTTON_SELECTORS = ["button.backBtn", "button:has(use[href='#icon_arrow_left'])"]
+_USER_NOT_FOUND_SELECTORS = [
+    "text=Пользователь не найден",
+    "text=пользователь не найден",
+    "text=Никого не найдено",
+    "text=User not found",
+    "text=No users found",
+]
 
 _PARSE_LAST_MESSAGE_JS = """
 () => {
@@ -597,9 +605,48 @@ class MaxBrowserManager:
             raise MaxMessengerError("Submit button 'Найти в MAX' not found.")
         await page.click(submit_selector)
 
+        not_found_selector = await self._wait_and_get_first(page, _USER_NOT_FOUND_SELECTORS, timeout_ms=2500)
+        if not_found_selector:
+            raise ContactNotFoundError(f"User not found by phone: {phone}")
+
         # Auto-wait for chat to open (no arbitrary sleep buffers)
         chat_found = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=10000)
-        return bool(chat_found)
+        if not chat_found:
+            raise ContactNotFoundError(f"User not found by phone: {phone}")
+        return True
+
+    async def _open_chat_by_chat_id(self, page: Page, chat_id: str, base_url: str) -> bool:
+        logger.info(f"Opening existing chat by chat_id: {chat_id}")
+        candidates = [
+            f"{base_url}/{chat_id}",
+        ]
+        #f"{base_url}?chatId={chat_id}",
+        #f"{base_url}/?chatId={chat_id}",
+        #f"{base_url}/#/chats/{chat_id}",
+
+        for url in candidates:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                opened = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=4000)
+                if opened:
+                    return True
+            except Exception:
+                continue
+
+        await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+        loc = page.locator(
+            f"[data-chat-id='{chat_id}'], [data-chatid='{chat_id}'], a[href*='{chat_id}']"
+        )
+        if await loc.count() > 0:
+            await loc.first.click()
+            opened = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=8000)
+            return bool(opened)
+        return False
+
+    async def _type_like_human(self, page: Page, selector: str, text: str) -> None:
+        await page.click(selector)
+        delay_ms = random.randint(25, 90)
+        await page.keyboard.type(text, delay=delay_ms)
 
     async def _attach_file_to_chat(self, page: Page, attachment_path: Union[str, Path]) -> None:
         path = Path(attachment_path)
@@ -622,7 +669,16 @@ class MaxBrowserManager:
 
         await self._wait_and_get_first(page, _ATTACHMENT_PREVIEW_SELECTORS, timeout_ms=15000)
 
-    async def send_message(self, phone: str, text: str, attachment_path: Optional[Union[str, Path]] = None, base_url: str = DEFAULT_BASE_URL) -> SendMaxMessageResult:
+    async def send_message(
+        self,
+        phone: str,
+        text: str,
+        attachment_path: Optional[Union[str, Path]] = None,
+        base_url: str = DEFAULT_BASE_URL,
+        chat_id: Optional[str] = None,
+        use_chat_id: bool = False,
+        humanize: bool = True,
+    ) -> SendMaxMessageResult:
         try:
             context = await self.get_context()
             try:
@@ -631,8 +687,24 @@ class MaxBrowserManager:
                     await self._attach_ws_sniffer_to_page(page, phone_for_mapping=phone)
                     await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
-                    if not await self._open_chat_by_phone(page, phone):
-                        return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Chat not opened")
+                    if use_chat_id and chat_id:
+                        if not await self._open_chat_by_chat_id(page, chat_id, base_url):
+                            return SendMaxMessageResult(
+                                sent_ok=False,
+                                status_note="failed",
+                                error_message=f"Existing chat not opened for chat_id={chat_id}",
+                            )
+                    else:
+                        try:
+                            if not await self._open_chat_by_phone(page, phone):
+                                raise ContactNotFoundError(f"User not found by phone: {phone}")
+                        except ContactNotFoundError as e:
+                            return SendMaxMessageResult(
+                                sent_ok=False,
+                                status_note="user_not_found_by_phone",
+                                error_message=str(e),
+                            )
+
                     await self._maybe_capture_chat_id(page, phone)
                     if phone not in self._chat_by_phone:
                         await self._wait_for_chat_id(phone, timeout_seconds=5.0)
@@ -641,13 +713,21 @@ class MaxBrowserManager:
                     if not message_selector:
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
+                    if humanize:
+                        human_delay = random.uniform(10, 30)
+                        logger.info(f"Human-like delay {human_delay:.1f}s before typing")
+                        await asyncio.sleep(human_delay)
+
                     await page.click(message_selector)
                     if attachment_path:
                         try:
                             await self._attach_file_to_chat(page, attachment_path)
                         except Exception as e:
                             return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
-                    await page.fill(message_selector, text)
+                    if humanize:
+                        await self._type_like_human(page, message_selector, text)
+                    else:
+                        await page.fill(message_selector, text)
                     await page.keyboard.press("Enter")
                     try:
                         await page.wait_for_function(
@@ -665,7 +745,7 @@ class MaxBrowserManager:
                     return SendMaxMessageResult(
                         sent_ok=True,
                         status_note="delivered",
-                        chat_id=self._chat_by_phone.get(phone),
+                        chat_id=self._chat_by_phone.get(phone) or chat_id,
                     )
                 finally:
                     try:
@@ -674,6 +754,12 @@ class MaxBrowserManager:
                         pass
             finally:
                 await context.close()
+        except ContactNotFoundError as e:
+            return SendMaxMessageResult(
+                sent_ok=False,
+                status_note="user_not_found_by_phone",
+                error_message=str(e),
+            )
         except Exception as e:
             logger.exception(f"Error sending message to {phone}")
             return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
@@ -690,7 +776,11 @@ class MaxBrowserManager:
                     await self._attach_ws_sniffer_to_page(page, phone_for_mapping=None)
                     await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
-                    if not await self._open_chat_by_phone(page, phone):
+                    try:
+                        opened = await self._open_chat_by_phone(page, phone)
+                    except ContactNotFoundError:
+                        return CheckMaxMessageResult(reply_value="", check_ok=False)
+                    if not opened:
                         return CheckMaxMessageResult(reply_value="", check_ok=False)
                     await self._maybe_capture_chat_id(page, phone)
 

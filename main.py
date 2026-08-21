@@ -20,10 +20,11 @@ from media_cache_manager import MediaCacheManager
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
 QUEUE_SEND = "tasks.messages.send"
+QUEUE_SEND_EXISTING = "tasks.messages.send_existing_chat"
 QUEUE_POLL = "tasks.messages.poll_replies"
 QUEUE_RESULTS = "tasks.messages.results_replies_queue"
 QUEUE_NOTIFY = "tasks.messages.tenant_admin_notify"
-_NOTIFICATION_PREFIX = "🔔 New responses received:"
+_NOTIFICATION_PREFIX = "🔔 Получены новые сообщения:"
 
 # --- Models ---
 class SendTask(BaseModel):
@@ -34,6 +35,11 @@ class SendTask(BaseModel):
     message_text: str
     attachment_url: Optional[str] = None
     attachment_name: Optional[str] = None
+    tenant_id: Optional[str] = None
+    messenger_type: Optional[str] = None
+    use_chat_id: bool = False
+    chat_id: Optional[str] = None
+    contact_type: Optional[str] = None
 
 class CallbackPayload(BaseModel):
     task_id: str
@@ -135,12 +141,12 @@ class MaxWorkerDaemon:
             logger.info(f"Forwarded WS event: status={status} chat_id={chat_id}")
 
     def format_notification_message(self, task: TenantAdminNotificationTask) -> str:
-        lines = ["🔔 New responses received:"]
+        lines = ["🔔 Получены новые сообщения:"]
         for i, reply in enumerate(task.replies, start=1):
             time_str = reply.time.strftime("%Y-%m-%d %H:%M:%S")
             lines.append(f"\n{i}. 📱 {reply.user_phone} ({reply.user_name})")
-            lines.append(f"   💬 Reply: {reply.message}")
-            lines.append(f"   🕒 Time: {time_str}")
+            lines.append(f"   💬 Ответ: {reply.message}")
+            lines.append(f"   🕒 Время: {time_str}")
         return "\n".join(lines)
 
     async def process_notify_task(self, message: aio_pika.IncomingMessage):
@@ -160,7 +166,7 @@ class MaxWorkerDaemon:
                 logger.info(f"Notification text:\n{notification_text}")
 
                 # Send message
-                result = await self.browser_manager.send_message(phone, notification_text)
+                result = await self.browser_manager.send_message(phone, notification_text, humanize=False)
                 if result.sent_ok:
                     logger.info(f"Notification sent successfully to {task.tenant_phone}")
                 else:
@@ -202,12 +208,29 @@ class MaxWorkerDaemon:
                     ))
                     return
 
-                result = await self.browser_manager.send_message(phone, task.message_text, attachment_path=attachment_path)
+                result = await self.browser_manager.send_message(
+                    phone,
+                    task.message_text,
+                    attachment_path=attachment_path,
+                    chat_id=task.chat_id,
+                    use_chat_id=bool(task.use_chat_id and task.chat_id),
+                )
                 await self.send_callback(CallbackPayload(
                     task_id=task.task_id,
                     status=result.status_note,
                     error_message=result.error_message
                 ))
+
+                if result.status_note == "user_not_found_by_phone":
+                    await self.publish_result(TargetResult(
+                        target_id=task.task_id,
+                        campaign_id=task.campaign_id,
+                        phone_number=phone,
+                        status="user_not_found_by_phone",
+                        timestamp=datetime.utcnow().isoformat() + "Z",
+                    ))
+                    logger.info(f"Soft-fail USER_NOT_FOUND_BY_PHONE for target {task.task_id} phone={phone}")
+                    return
 
                 # Now, also publish to RESULTS_QUEUE with "sent" status!
                 if result.sent_ok:
@@ -308,14 +331,16 @@ class MaxWorkerDaemon:
                 await channel.set_qos(prefetch_count=1)
 
                 send_queue = await channel.declare_queue(QUEUE_SEND, durable=True)
+                existing_queue = await channel.declare_queue(QUEUE_SEND_EXISTING, durable=True)
                 poll_queue = await channel.declare_queue(QUEUE_POLL, durable=True)
                 results_queue = await channel.declare_queue(QUEUE_RESULTS, durable=True)
                 notify_queue = await channel.declare_queue(QUEUE_NOTIFY, durable=True)
 
-                logger.info(f"Waiting for messages on {QUEUE_SEND}, {QUEUE_POLL}, {QUEUE_NOTIFY}...")
+                logger.info(f"Waiting for messages on {QUEUE_SEND}, {QUEUE_SEND_EXISTING}, {QUEUE_POLL}, {QUEUE_NOTIFY}...")
                 
                 # Consume from all queues
                 await send_queue.consume(self.process_send_task)
+                await existing_queue.consume(self.process_send_task)
                 await poll_queue.consume(self.process_poll_task)
                 await notify_queue.consume(self.process_notify_task)
 
