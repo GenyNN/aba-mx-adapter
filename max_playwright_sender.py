@@ -92,6 +92,16 @@ _ATTACH_BUTTON_SELECTORS = [
     "button[aria-label*='Прикреп']",
     "button[aria-label*='Attach']",
 ]
+_ATTACH_MENU_MEDIA_SELECTORS = [
+    "[role='menuitem']:has-text('Фото или видео')",
+    "[role='menuitem']:has-text('Фото и видео')",
+    "[role='menuitem']:has-text('Фото/Видео')",
+    "[role='menuitem']:has-text('Фото')",
+    "[role='menuitem']:has-text('Photo or video')",
+    "[role='menuitem']:has-text('Photo & video')",
+    "[role='menuitem']:has-text('Photo/Video')",
+    "[role='menuitem']:has-text('Photo')",
+]
 _ATTACH_MENU_FILE_SELECTORS = [
     "[role='menuitem']:has-text('Файл')",
     "[role='menuitem']:has-text('Документ')",
@@ -103,6 +113,13 @@ _ATTACHMENT_PREVIEW_SELECTORS = [
     "[data-testid*='attachment']",
     "a[href][download]",
 ]
+
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif", ".tiff", ".tif"}
+
+
+def _is_image_file(path: Path) -> bool:
+    ext = path.suffix.lower()
+    return ext in _IMAGE_EXTENSIONS
 #"div[placeholder*='Messagne'
 _OPENED_CHAT_SELECTORS = [".openedChat", "[class*='openedChat']"]
 _CHAT_HISTORY_SELECTORS = [".openedChat .history", "[class*='openedChat'] [class*='history']"]
@@ -658,11 +675,18 @@ class MaxBrowserManager:
             await self._diag_snapshot(page, "attach_button_missing")
             raise MaxMessengerError("Attach button not found")
 
+        is_image = _is_image_file(path)
+        menu_selectors = _ATTACH_MENU_MEDIA_SELECTORS if is_image else _ATTACH_MENU_FILE_SELECTORS
+
         async with page.expect_file_chooser(timeout=15000) as fc_info:
             await page.click(attach_selector)
-            menu_selector = await self._wait_and_get_first(page, _ATTACH_MENU_FILE_SELECTORS, timeout_ms=1500)
+            menu_selector = await self._wait_and_get_first(page, menu_selectors, timeout_ms=1500)
             if menu_selector:
                 await page.click(menu_selector)
+            else:
+                fallback_selector = await self._wait_and_get_first(page, _ATTACH_MENU_FILE_SELECTORS, timeout_ms=800)
+                if fallback_selector:
+                    await page.click(fallback_selector)
 
         chooser = await fc_info.value
         await chooser.set_files(str(path))
@@ -990,6 +1014,7 @@ def _lz4_decompress(src: bytes, max_output_size: int) -> bytes:
                 ref += 1
     return bytes(out[:oi])
 
+// decoding raw message
 def _msgpack_decode(data: bytes) -> Any:
     def read(n: int) -> bytes:
         nonlocal pos
