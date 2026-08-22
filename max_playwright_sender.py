@@ -660,10 +660,88 @@ class MaxBrowserManager:
             return bool(opened)
         return False
 
+    async def _insert_multiline_text_into_input(self, page: Page, selector: str, text: str) -> None:
+        """Вставляет многострочный текст в contenteditable-поле через DOM.
+        Использует <br> для переносов строк, диспатчит input/change события,
+        чтобы приложение распознало изменение как пользовательский ввод.
+        Полностью исключает риск отправки сообщения при вводе \n."""
+        if text is None:
+            text = ""
+        # Нормализуем переводы: \\r\\n -> \\n, затем \\r -> \\n
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        # Экранируем HTML-специальные символы в тексте, чтобы инжект был безопасным
+        escaped = (
+            normalized.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+            .replace("'", "&#39;")
+        )
+        # Собираем HTML с <br> вместо переносов строк. Пустые строки сохраняем через повторяющиеся <br>.
+        lines = escaped.split("\n")
+        html_with_br = "<br>".join(lines)
+
+        await page.evaluate(
+            """
+            ([sel, html]) => {
+                const target = document.querySelector(sel);
+                if (!target) return;
+                const isContentEditable = target.isContentEditable;
+                // Фокус, чтобы состояние поля соответствовало реальному вводу
+                if (typeof target.focus === "function") {
+                    target.focus();
+                }
+                if (isContentEditable) {
+                    target.innerHTML = html;
+                } else if (target.tagName === "TEXTAREA" || target.tagName === "INPUT") {
+                    // На случай, если селектор вдруг проматчит обычное поле
+                    const plain = String(html)
+                        .replace(/<br\\s*\\/?>/gi, "\\n")
+                        .replace(/&amp;/g, "&")
+                        .replace(/&lt;/g, "<")
+                        .replace(/&gt;/g, ">")
+                        .replace(/&quot;/g, '"')
+                        .replace(/&#39;/g, "'");
+                    target.value = plain;
+                }
+                // Триггерим нужные события, чтобы фреймворк React/Vue/кастом подхватил значение
+                try {
+                    target.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+                    target.dispatchEvent(new Event("change", { bubbles: true, cancelable: true }));
+                    target.dispatchEvent(new Event("keydown", { bubbles: true, cancelable: true }));
+                    target.dispatchEvent(new Event("keyup", { bubbles: true, cancelable: true }));
+                } catch (_) {}
+                // Установим курсор в конец, чтобы пользовательское поведение было естественным
+                try {
+                    if (isContentEditable && typeof window.getSelection === "function") {
+                        const range = document.createRange();
+                        range.selectNodeContents(target);
+                        range.collapse(false);
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        sel.addRange(range);
+                    }
+                } catch (_) {}
+            }
+            """,
+            [selector, html_with_br],
+        )
+
     async def _type_like_human(self, page: Page, selector: str, text: str) -> None:
         await page.click(selector)
-        delay_ms = random.randint(25, 90)
-        await page.keyboard.type(text, delay=delay_ms)
+        if not text:
+            return
+        delay_ms = random.randint(14, 49)
+        # Нормализуем переводы \\r\\n -> \\n
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        parts = normalized.split("\n")
+        await page.keyboard.type(parts[0], delay=delay_ms)
+        for part in parts[1:]:
+            await page.keyboard.down("Shift")
+            await page.keyboard.press("Enter")
+            await page.keyboard.up("Shift")
+            if part:
+                await page.keyboard.type(part, delay=delay_ms)
 
     async def _attach_file_to_chat(self, page: Page, attachment_path: Union[str, Path]) -> None:
         path = Path(attachment_path)
@@ -738,7 +816,7 @@ class MaxBrowserManager:
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
                     if humanize:
-                        human_delay = random.uniform(10, 30)
+                        human_delay = random.uniform(11, 29)
                         logger.info(f"Human-like delay {human_delay:.1f}s before typing")
                         await asyncio.sleep(human_delay)
 
@@ -748,10 +826,12 @@ class MaxBrowserManager:
                             await self._attach_file_to_chat(page, attachment_path)
                         except Exception as e:
                             return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
+
+                    normalized_text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+                    await page.fill(message_selector, normalized_text)
+
                     if humanize:
-                        await self._type_like_human(page, message_selector, text)
-                    else:
-                        await page.fill(message_selector, text)
+                        await asyncio.sleep(random.uniform(1, 2.8))
                     await page.keyboard.press("Enter")
                     try:
                         await page.wait_for_function(
@@ -1014,7 +1094,6 @@ def _lz4_decompress(src: bytes, max_output_size: int) -> bytes:
                 ref += 1
     return bytes(out[:oi])
 
-// decoding raw message
 def _msgpack_decode(data: bytes) -> Any:
     def read(n: int) -> bytes:
         nonlocal pos
