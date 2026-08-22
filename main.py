@@ -3,8 +3,26 @@ import json
 import logging
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    # Python < 3.9 fallback
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
+MSK_TZ = ZoneInfo("Europe/Moscow")
+
+
+def to_moscow_time(dt: datetime) -> datetime:
+    """Convert datetime to Europe/Moscow timezone.
+
+    If dt is naive (no tzinfo), assume it's UTC (as our services always store/transmit UTC).
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(MSK_TZ)
 
 import aio_pika
 import httpx
@@ -143,7 +161,8 @@ class MaxWorkerDaemon:
     def format_notification_message(self, task: TenantAdminNotificationTask) -> str:
         lines = ["🔔 Получены новые сообщения:"]
         for i, reply in enumerate(task.replies, start=1):
-            time_str = reply.time.strftime("%Y-%m-%d %H:%M:%S")
+            moscow_time = to_moscow_time(reply.time)
+            time_str = moscow_time.strftime("%Y-%m-%d %H:%M:%S")
             lines.append(f"\n{i}. 📱 {reply.user_phone} ({reply.user_name})")
             lines.append(f"   💬 Ответ: {reply.message}")
             lines.append(f"   🕒 Время: {time_str}")
