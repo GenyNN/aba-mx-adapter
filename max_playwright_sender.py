@@ -731,7 +731,7 @@ class MaxBrowserManager:
         await page.click(selector)
         if not text:
             return
-        delay_ms = random.randint(14, 49)
+        delay_ms = random.randint(14, 49) #
         # Нормализуем переводы \\r\\n -> \\n
         normalized = text.replace("\r\n", "\n").replace("\r", "\n")
         parts = normalized.split("\n")
@@ -816,7 +816,7 @@ class MaxBrowserManager:
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
                     if humanize:
-                        human_delay = random.uniform(11, 29)
+                        human_delay = random.uniform(11, 29) #
                         logger.info(f"Human-like delay {human_delay:.1f}s before typing")
                         await asyncio.sleep(human_delay)
 

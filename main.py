@@ -76,11 +76,13 @@ class PollTask(BaseModel):
 class TargetResult(BaseModel):
     target_id: str
     campaign_id: str
+    tenant_id: Optional[str] = None
     phone_number: str
     status: str
     reply_text: Optional[str] = None
     timestamp: str
     chat_id: Optional[str] = None
+    messenger_type: Optional[str] = None
 
 class ClientReplyInfo(BaseModel):
     user_phone: str
@@ -90,6 +92,9 @@ class ClientReplyInfo(BaseModel):
 
 class TenantAdminNotificationTask(BaseModel):
     tenant_phone: str
+    tenant_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    use_chat_id: bool = False
     replies: List[ClientReplyInfo]
 
 # --- Worker Logic ---
@@ -173,7 +178,7 @@ class MaxWorkerDaemon:
             async with message.process():
                 body = json.loads(message.body.decode())
                 task = TenantAdminNotificationTask(**body)
-                logger.info(f"Processing notify task for tenant: {task.tenant_phone} with {len(task.replies)} replies")
+                logger.info(f"Processing notify task for tenant: {task.tenant_phone} (tenant_id={task.tenant_id!r}, use_chat_id={task.use_chat_id}, chat_id={task.chat_id!r}) with {len(task.replies)} replies")
 
                 phone = normalize_phone_for_max(task.tenant_phone)
                 if not phone:
@@ -184,10 +189,32 @@ class MaxWorkerDaemon:
                 notification_text = self.format_notification_message(task)
                 logger.info(f"Notification text:\n{notification_text}")
 
-                # Send message
-                result = await self.browser_manager.send_message(phone, notification_text, humanize=False)
+                # Send message (use_chat_id=True if the orchestrator already knows the admin's chat_id)
+                use_chat_id = bool(task.use_chat_id and task.chat_id)
+                result = await self.browser_manager.send_message(
+                    phone,
+                    notification_text,
+                    humanize=False,
+                    chat_id=task.chat_id,
+                    use_chat_id=use_chat_id,
+                )
                 if result.sent_ok:
                     logger.info(f"Notification sent successfully to {task.tenant_phone}")
+                    # Notify the orchestrator about the chat_id so that it is saved upon the first success
+                    # and subsequent notifications are sent by chat_id.
+                    try:
+                        await self.publish_result(TargetResult(
+                            target_id="",
+                            campaign_id="",
+                            tenant_id=task.tenant_id or "",
+                            phone_number=phone,
+                            status="sent",
+                            timestamp=datetime.utcnow().isoformat() + "Z",
+                            chat_id=result.chat_id or task.chat_id or "",
+                            messenger_type="MAX",
+                        ))
+                    except Exception as pub_err:
+                        logger.error(f"Failed to publish admin notify result: {pub_err}")
                 else:
                     logger.error(f"Failed to send notification: {result.error_message}")
         except Exception as e:
