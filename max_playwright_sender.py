@@ -13,6 +13,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
 
+import platform
+import glob
+
 from playwright.async_api import (
     Browser,
     BrowserContext,
@@ -214,6 +217,19 @@ class MaxBrowserManager:
         self.playwright = await async_playwright().start()
 
         # Start the persistent context
+        print("========== PLAYWRIGHT DEBUG ==========")
+        print("OS:", platform.platform())
+        print("Python:", sys.version)
+        print("DISPLAY:", os.environ.get("DISPLAY"))
+        print("HOME:", os.environ.get("HOME"))
+        print("PWD:", os.getcwd())
+        print("USER_DATA_DIR:", self.user_data_dir)
+        print("ABS USER_DATA_DIR:", os.path.abspath(self.user_data_dir))
+        print("EXISTS:", os.path.exists(self.user_data_dir))
+        print("CONTENTS:", glob.glob(os.path.join(self.user_data_dir, "*")))
+        print("HEADLESS:", self.headless)
+        print("PLAYWRIGHT:", self.playwright)
+        print("======================================")
         self.context = await self.playwright.chromium.launch_persistent_context(
             user_data_dir=self.user_data_dir,
             headless=self.headless,
