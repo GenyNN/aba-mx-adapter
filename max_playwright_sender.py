@@ -15,6 +15,8 @@ from typing import Any, Dict, Iterable, List, Optional, Union
 
 import platform
 import glob
+import importlib.metadata
+import subprocess
 
 from playwright.async_api import (
     Browser,
@@ -218,6 +220,24 @@ class MaxBrowserManager:
 
         # Start the persistent context
         print("========== PLAYWRIGHT DEBUG ==========")
+        print("PLAYWRIGHT VERSION:", importlib.metadata.version("playwright"))
+
+        print(
+            "CHROMIUM EXECUTABLE:",
+            self.playwright.chromium.executable_path,
+        )
+
+        try:
+            print(
+                "CHROMIUM VERSION:",
+                subprocess.check_output(
+                    [self.playwright.chromium.executable_path, "--version"],
+                    text=True,
+                    stderr=subprocess.STDOUT,
+                ).strip(),
+            )
+        except Exception as e:
+            print("CHROMIUM VERSION ERROR:", repr(e))
         print("OS:", platform.platform())
         print("Python:", sys.version)
         print("DISPLAY:", os.environ.get("DISPLAY"))
