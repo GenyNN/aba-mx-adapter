@@ -1,6 +1,8 @@
 import asyncio
 import base64
 from collections import OrderedDict
+import importlib.metadata
+import inspect
 import json
 import logging
 import os
@@ -8,15 +10,11 @@ import random
 import re
 import struct
 import sys
+import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Union
-
-import platform
-import glob
-import importlib.metadata
-import subprocess
 
 from playwright.async_api import (
     Browser,
@@ -27,6 +25,7 @@ from playwright.async_api import (
     async_playwright,
 )
 
+#version 1
 # Structured JSON Logger setup
 class JsonFormatter(logging.Formatter):
     def format(self, record):
@@ -43,9 +42,14 @@ class JsonFormatter(logging.Formatter):
 
 logger = logging.getLogger("max_worker")
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(JsonFormatter())
-logger.addHandler(handler)
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(JsonFormatter())
+    logger.addHandler(handler)
+
+logger.info(
+    f"max_playwright_sender loaded pid={os.getpid()} ppid={os.getppid()} file={__file__} cwd={os.getcwd()} python={sys.executable} argv={sys.argv}"
+)
 
 DEFAULT_SESSION_FILE = "max_auth.json"
 DEFAULT_BASE_URL = "https://web.max.ru"
@@ -54,7 +58,6 @@ _NOTIFICATION_PREFIX = "🔔 Получены новые сообщения:"
 _PHONE_CHAT_CACHE_MAX_SIZE = 5000
 _DIAG_DUMP_MAX_FILES = 20
 _DIAG_DUMP_MAX_AGE = timedelta(hours=24)
-USER_DATA_DIR = os.path.abspath("./user_data_dir")
 
 class MaxMessengerError(RuntimeError):
     """Base error for Max messenger automation."""
@@ -179,10 +182,13 @@ class MaxBrowserManager:
         self.max_tasks = max_tasks
         self.restart_interval_seconds = restart_interval_seconds
         self.base_url = base_url
+        self.browser_channel = (os.getenv("BROWSER_CHANNEL") or "chrome").strip()
         self.tasks_count = 0
         self.playwright = None
         self.browser: Optional[Browser] = None
         self._lock = asyncio.Lock()
+        self._startup_lock = asyncio.Lock()
+        self._startup_count = 0
         self._restart_task: Optional[asyncio.Task] = None
         self._listener_context: Optional[BrowserContext] = None
         self._listener_page: Optional[Page] = None
@@ -191,18 +197,62 @@ class MaxBrowserManager:
         self._chat_by_phone: "OrderedDict[str, str]" = OrderedDict()
         self._phone_by_chat_id: "OrderedDict[str, str]" = OrderedDict()
         self._chat_status: Dict[str, Dict[str, Any]] = {}
-        self.user_data_dir = USER_DATA_DIR
-        self.context: Optional[BrowserContext] = None
+
+    def _startup_caller_tag(self) -> str:
+        try:
+            frame = inspect.stack()[2]
+            return f"{os.path.basename(frame.filename)}:{frame.lineno}:{frame.function}"
+        except Exception:
+            return "unknown"
+
+    def _env_diag(self) -> Dict[str, Optional[str]]:
+        keys = [
+            "DISPLAY",
+            "PWDEBUG",
+            "DEBUG",
+            "PLAYWRIGHT_BROWSERS_PATH",
+            "CHROME_USER_DATA_DIR",
+            "CHROME_CONFIG_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_CACHE_HOME",
+            "HOME",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+        ]
+        return {k: os.getenv(k) for k in keys}
+
+    def _playwright_diag(self) -> Dict[str, str]:
+        try:
+            return {"playwright": importlib.metadata.version("playwright")}
+        except Exception:
+            return {"playwright": "unknown"}
 
     async def start(self):
-        if not self.browser:
-            logger.info("Starting Chromium browser...")
-            await self._start_browser_only()
-            self.tasks_count = 0
-        if not self._listener_page:
-            await self._start_listener()
-        if not self._restart_task:
-            self._restart_task = asyncio.create_task(self._scheduled_restart_loop())
+        caller = self._startup_caller_tag()
+        pid = os.getpid()
+        async with self._startup_lock:
+            self._startup_count += 1
+            startup_n = self._startup_count
+            logger.info(
+                f"startup_enter n={startup_n} pid={pid} caller={caller} has_browser={bool(self.browser)} has_listener={bool(self._listener_page)} channel={self.browser_channel!r} headless={self.headless} env={self._env_diag()} pw={self._playwright_diag()}"
+            )
+            if not self.browser:
+                logger.info(f"startup_browser_begin n={startup_n} pid={pid} caller={caller}")
+                await self._start_browser_only(startup_n=startup_n, caller=caller)
+                self.tasks_count = 0
+                logger.info(f"startup_browser_ok n={startup_n} pid={pid} caller={caller}")
+            if not self._listener_page:
+                logger.info(f"startup_listener_begin n={startup_n} pid={pid} caller={caller}")
+                await self._start_listener(startup_n=startup_n, caller=caller)
+                logger.info(f"startup_listener_ok n={startup_n} pid={pid} caller={caller}")
+            if not self._restart_task:
+                self._restart_task = asyncio.create_task(self._scheduled_restart_loop())
+                logger.info(f"startup_restart_loop_started n={startup_n} pid={pid} caller={caller}")
+            logger.info(
+                f"startup_exit n={startup_n} pid={pid} caller={caller} has_browser={bool(self.browser)} has_listener={bool(self._listener_page)}"
+            )
 
     async def stop(self):
         if self._restart_task:
@@ -215,68 +265,41 @@ class MaxBrowserManager:
         await self._close_listener()
         await self._close_browser_only()
 
-    async def _start_browser_only(self):
-        self.playwright = await async_playwright().start()
-
-        # Start the persistent context
-        print("========== PLAYWRIGHT DEBUG ==========")
-        print("PLAYWRIGHT VERSION:", importlib.metadata.version("playwright"))
-
-        print(
-            "CHROMIUM EXECUTABLE:",
-            self.playwright.chromium.executable_path,
-        )
-
+    async def _start_browser_only(self, startup_n: int, caller: str):
         try:
-            print(
-                "CHROMIUM VERSION:",
-                subprocess.check_output(
-                    [self.playwright.chromium.executable_path, "--version"],
-                    text=True,
-                    stderr=subprocess.STDOUT,
-                ).strip(),
+            logger.info(
+                f"browser_only_begin n={startup_n} pid={os.getpid()} caller={caller} mode=launch channel={self.browser_channel!r} headless={self.headless} has_playwright={bool(self.playwright)} has_browser={bool(self.browser)}"
+            )
+            self.playwright = await async_playwright().start()
+            chromium = self.playwright.chromium
+            try:
+                executable_path = getattr(chromium, "executable_path", None)
+            except Exception:
+                executable_path = None
+            logger.info(
+                f"browser_only_playwright_started n={startup_n} pid={os.getpid()} caller={caller} chromium_executable_path={executable_path!r}"
+            )
+            self.browser = await chromium.launch(
+                headless=self.headless,
+                channel=self.browser_channel,
+            )
+            logger.info(
+                f"browser_only_ok n={startup_n} pid={os.getpid()} caller={caller}"
             )
         except Exception as e:
-            print("CHROMIUM VERSION ERROR:", repr(e))
-        print("OS:", platform.platform())
-        print("Python:", sys.version)
-        print("DISPLAY:", os.environ.get("DISPLAY"))
-        print("HOME:", os.environ.get("HOME"))
-        print("PWD:", os.getcwd())
-        print("USER_DATA_DIR:", self.user_data_dir)
-        print("ABS USER_DATA_DIR:", os.path.abspath(self.user_data_dir))
-        print("EXISTS:", os.path.exists(self.user_data_dir))
-        print("CONTENTS:", glob.glob(os.path.join(self.user_data_dir, "*")))
-        print("HEADLESS:", self.headless)
-        print("PLAYWRIGHT:", self.playwright)
-        print("======================================")
-        self.context = await self.playwright.chromium.launch_persistent_context(
-            user_data_dir=self.user_data_dir,
-            headless=self.headless,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ]
-        )
-        # We bind self.browser to the context so that the framework understands that the browser is already active
-        self.browser = self.context.browser if hasattr(self.context, 'browser') else self.context
-
-        # Blocking heavy resources
-        await self._block_heavy_resources(self.context)
+            logger.error(
+                f"browser_only_failed n={startup_n} pid={os.getpid()} caller={caller} err={type(e).__name__}: {e} stack={''.join(traceback.format_exception(type(e), e, e.__traceback__))}"
+            )
+            await self._close_browser_only()
+            raise
 
     async def _close_browser_only(self):
-        # Close the context (since in persistent mode, the browser and context are one object)
-        target = self.context or self.browser
-        if target:
+        if self.browser:
             logger.info("Closing Chromium browser...")
             try:
-                await target.close()
+                await self.browser.close()
             except Exception:
                 pass
-            self.context = None
             self.browser = None
         if self.playwright:
             try:
@@ -312,13 +335,23 @@ class MaxBrowserManager:
         return None
 
     async def _restart_browser(self, reason: str):
-        logger.info(f"Restarting browser. reason={reason}")
-        self._chat_status.clear()
-        await self._close_listener()
-        await self._close_browser_only()
-        await self._start_browser_only()
-        self.tasks_count = 0
-        await self._start_listener()
+        caller = f"restart:{reason}"
+        pid = os.getpid()
+        async with self._startup_lock:
+            self._startup_count += 1
+            startup_n = self._startup_count
+            logger.info(
+                f"restart_enter n={startup_n} pid={pid} reason={reason} has_browser={bool(self.browser)} has_listener={bool(self._listener_page)}"
+            )
+            self._chat_status.clear()
+            await self._close_listener()
+            await self._close_browser_only()
+            await self._start_browser_only(startup_n=startup_n, caller=caller)
+            self.tasks_count = 0
+            await self._start_listener(startup_n=startup_n, caller=caller)
+            logger.info(
+                f"restart_exit n={startup_n} pid={pid} reason={reason} has_browser={bool(self.browser)} has_listener={bool(self._listener_page)}"
+            )
 
     async def _close_listener(self):
         if self._listener_page:
@@ -340,29 +373,28 @@ class MaxBrowserManager:
             if self.tasks_count > self.max_tasks:
                 logger.info(f"Task limit ({self.max_tasks}) reached. Restarting browser...")
                 await self._restart_browser("task_limit")
-
-            if not self.context:
+            
+            if not self.browser:
                 await self.start()
+                
+            session_path = Path(self.session_file)
+            if not session_path.exists():
+                raise MaxMessengerError(f"Session file not found: {session_path}")
+                
+            context = await self.browser.new_context(storage_state=str(session_path))
+            await self._block_heavy_resources(context)
+            return context
 
-            return self.context
-
-    async def _start_listener(self):
+    async def _start_listener(self, startup_n: int, caller: str):
         if not self.browser:
-            await self._start_browser_only()
-
-        # Reuse a running persistent context instead of creating a new one
-        context = self.context
-
+            raise MaxMessengerError("Listener start requested but browser is not running")
+        logger.info(
+            f"listener_begin n={startup_n} pid={os.getpid()} caller={caller} session_file={self.session_file!r} base_url={self.base_url!r}"
+        )
         session_path = Path(self.session_file)
-        if session_path.exists():
-            # If we need to force cookies from the authorization file
-            try:
-                data = json.loads(session_path.read_text(encoding="utf-8"))
-                if "cookies" in data:
-                    await context.add_cookies(data["cookies"])
-            except Exception as e:
-                logger.warning(f"Could not load state from session file: {e}")
-
+        if not session_path.exists():
+            raise MaxMessengerError(f"Session file not found: {session_path}")
+        context = await self.browser.new_context(storage_state=str(session_path))
         await self._block_heavy_resources(context)
         page = await context.new_page()
         await page.expose_function("__max_ws_sniffer_emit", self._on_ws_sniffer_emit)
@@ -372,6 +404,9 @@ class MaxBrowserManager:
         await page.goto(self.base_url, wait_until="domcontentloaded", timeout=45000)
         self._listener_context = context
         self._listener_page = page
+        logger.info(
+            f"listener_ok n={startup_n} pid={os.getpid()} caller={caller}"
+        )
 
     async def _attach_ws_sniffer_to_page(self, page: Page, phone_for_mapping: Optional[str]) -> None:
         sniffer_path = Path(__file__).with_name("max_ws_sniffer.js")
@@ -720,81 +755,12 @@ class MaxBrowserManager:
             return bool(opened)
         return False
 
-    async def _insert_multiline_text_into_input(self, page: Page, selector: str, text: str) -> None:
-        """Вставляет многострочный текст в contenteditable-поле через DOM.
-        Использует <br> для переносов строк, диспатчит input/change события,
-        чтобы приложение распознало изменение как пользовательский ввод.
-        Полностью исключает риск отправки сообщения при вводе \n."""
-        if text is None:
-            text = ""
-        # Нормализуем переводы: \\r\\n -> \\n, затем \\r -> \\n
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        # Экранируем HTML-специальные символы в тексте, чтобы инжект был безопасным
-        escaped = (
-            normalized.replace("&", "&amp;")
-            .replace("<", "&lt;")
-            .replace(">", "&gt;")
-            .replace('"', "&quot;")
-            .replace("'", "&#39;")
-        )
-        # Собираем HTML с <br> вместо переносов строк. Пустые строки сохраняем через повторяющиеся <br>.
-        lines = escaped.split("\n")
-        html_with_br = "<br>".join(lines)
-
-        await page.evaluate(
-            """
-            ([sel, html]) => {
-                const target = document.querySelector(sel);
-                if (!target) return;
-                const isContentEditable = target.isContentEditable;
-                // Фокус, чтобы состояние поля соответствовало реальному вводу
-                if (typeof target.focus === "function") {
-                    target.focus();
-                }
-                if (isContentEditable) {
-                    target.innerHTML = html;
-                } else if (target.tagName === "TEXTAREA" || target.tagName === "INPUT") {
-                    // На случай, если селектор вдруг проматчит обычное поле
-                    const plain = String(html)
-                        .replace(/<br\\s*\\/?>/gi, "\\n")
-                        .replace(/&amp;/g, "&")
-                        .replace(/&lt;/g, "<")
-                        .replace(/&gt;/g, ">")
-                        .replace(/&quot;/g, '"')
-                        .replace(/&#39;/g, "'");
-                    target.value = plain;
-                }
-                // Триггерим нужные события, чтобы фреймворк React/Vue/кастом подхватил значение
-                try {
-                    target.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
-                    target.dispatchEvent(new Event("change", { bubbles: true, cancelable: true }));
-                    target.dispatchEvent(new Event("keydown", { bubbles: true, cancelable: true }));
-                    target.dispatchEvent(new Event("keyup", { bubbles: true, cancelable: true }));
-                } catch (_) {}
-                // Установим курсор в конец, чтобы пользовательское поведение было естественным
-                try {
-                    if (isContentEditable && typeof window.getSelection === "function") {
-                        const range = document.createRange();
-                        range.selectNodeContents(target);
-                        range.collapse(false);
-                        const sel = window.getSelection();
-                        sel.removeAllRanges();
-                        sel.addRange(range);
-                    }
-                } catch (_) {}
-            }
-            """,
-            [selector, html_with_br],
-        )
-
     async def _type_like_human(self, page: Page, selector: str, text: str) -> None:
         await page.click(selector)
         if not text:
             return
-        delay_ms = random.randint(14, 49) #
-        # Нормализуем переводы \\r\\n -> \\n
-        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-        parts = normalized.split("\n")
+        delay_ms = random.randint(25, 90)
+        parts = text.split("\n")
         await page.keyboard.type(parts[0], delay=delay_ms)
         for part in parts[1:]:
             await page.keyboard.down("Shift")
@@ -843,78 +809,79 @@ class MaxBrowserManager:
     ) -> SendMaxMessageResult:
         try:
             context = await self.get_context()
-            page = await context.new_page()
             try:
-                await self._attach_ws_sniffer_to_page(page, phone_for_mapping=phone)
-                await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
-
-                if use_chat_id and chat_id:
-                    if not await self._open_chat_by_chat_id(page, chat_id, base_url):
-                        return SendMaxMessageResult(
-                            sent_ok=False,
-                            status_note="failed",
-                            error_message=f"Existing chat not opened for chat_id={chat_id}",
-                        )
-                else:
-                    try:
-                        if not await self._open_chat_by_phone(page, phone):
-                            raise ContactNotFoundError(f"User not found by phone: {phone}")
-                    except ContactNotFoundError as e:
-                        return SendMaxMessageResult(
-                            sent_ok=False,
-                            status_note="user_not_found_by_phone",
-                            error_message=str(e),
-                        )
-
-                await self._maybe_capture_chat_id(page, phone)
-                if phone not in self._chat_by_phone:
-                    await self._wait_for_chat_id(phone, timeout_seconds=5.0)
-
-                message_selector = await self._wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=3000)
-                if not message_selector:
-                    return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
-
-                if humanize:
-                    human_delay = random.uniform(11, 29) #
-                    logger.info(f"Human-like delay {human_delay:.1f}s before typing")
-                    await asyncio.sleep(human_delay)
-
-                await page.click(message_selector)
-                if attachment_path:
-                    try:
-                        await self._attach_file_to_chat(page, attachment_path)
-                    except Exception as e:
-                        return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
-
-                normalized_text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-                await page.fill(message_selector, normalized_text)
-
-                if humanize:
-                    await asyncio.sleep(random.uniform(1, 2.8))
-                await page.keyboard.press("Enter")
+                page = await context.new_page()
                 try:
-                    await page.wait_for_function(
-                        """() => {
-                            const wrappers = document.querySelectorAll('div[class*="messageWrapper"]');
-                            if (!wrappers.length) return false;
-                            const last = wrappers[wrappers.length - 1];
-                            return (last.className || '').includes('messageWrapper--isOut');
-                        }""",
-                        timeout=5000,
+                    await self._attach_ws_sniffer_to_page(page, phone_for_mapping=phone)
+                    await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
+
+                    if use_chat_id and chat_id:
+                        if not await self._open_chat_by_chat_id(page, chat_id, base_url):
+                            return SendMaxMessageResult(
+                                sent_ok=False,
+                                status_note="failed",
+                                error_message=f"Existing chat not opened for chat_id={chat_id}",
+                            )
+                    else:
+                        try:
+                            if not await self._open_chat_by_phone(page, phone):
+                                raise ContactNotFoundError(f"User not found by phone: {phone}")
+                        except ContactNotFoundError as e:
+                            return SendMaxMessageResult(
+                                sent_ok=False,
+                                status_note="user_not_found_by_phone",
+                                error_message=str(e),
+                            )
+
+                    await self._maybe_capture_chat_id(page, phone)
+                    if phone not in self._chat_by_phone:
+                        await self._wait_for_chat_id(phone, timeout_seconds=5.0)
+
+                    message_selector = await self._wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=3000)
+                    if not message_selector:
+                        return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
+
+                    if humanize:
+                        human_delay = random.uniform(10, 30)
+                        logger.info(f"Human-like delay {human_delay:.1f}s before typing")
+                        await asyncio.sleep(human_delay)
+
+                    await page.click(message_selector)
+                    if attachment_path:
+                        try:
+                            await self._attach_file_to_chat(page, attachment_path)
+                        except Exception as e:
+                            return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
+                    if humanize:
+                        await self._type_like_human(page, message_selector, text)
+                    else:
+                        await self._type_like_human(page, message_selector, text)
+                    await page.keyboard.press("Enter")
+                    try:
+                        await page.wait_for_function(
+                            """() => {
+                                const wrappers = document.querySelectorAll('div[class*="messageWrapper"]');
+                                if (!wrappers.length) return false;
+                                const last = wrappers[wrappers.length - 1];
+                                return (last.className || '').includes('messageWrapper--isOut');
+                            }""",
+                            timeout=5000,
+                        )
+                    except PlaywrightTimeoutError:
+                        pass
+
+                    return SendMaxMessageResult(
+                        sent_ok=True,
+                        status_note="delivered",
+                        chat_id=self._chat_by_phone.get(phone) or chat_id,
                     )
-                except PlaywrightTimeoutError:
-                    pass
-
-                return SendMaxMessageResult(
-                    sent_ok=True,
-                    status_note="delivered",
-                    chat_id=self._chat_by_phone.get(phone) or chat_id,
-                )
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
             finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                await context.close()
         except ContactNotFoundError as e:
             return SendMaxMessageResult(
                 sent_ok=False,
@@ -931,59 +898,61 @@ class MaxBrowserManager:
             return cached
         try:
             context = await self.get_context()
-            page = await context.new_page()
             try:
-                await self._attach_ws_sniffer_to_page(page, phone_for_mapping=None)
-                await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
-
+                page = await context.new_page()
                 try:
-                    opened = await self._open_chat_by_phone(page, phone)
-                except ContactNotFoundError:
-                    return CheckMaxMessageResult(reply_value="", check_ok=False)
-                if not opened:
-                    return CheckMaxMessageResult(reply_value="", check_ok=False)
-                await self._maybe_capture_chat_id(page, phone)
+                    await self._attach_ws_sniffer_to_page(page, phone_for_mapping=None)
+                    await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
 
-                await self._wait_and_get_first(page, _CHAT_HISTORY_SELECTORS, timeout_ms=8000)
-                payload = await page.evaluate(_PARSE_LAST_MESSAGE_JS)
+                    try:
+                        opened = await self._open_chat_by_phone(page, phone)
+                    except ContactNotFoundError:
+                        return CheckMaxMessageResult(reply_value="", check_ok=False)
+                    if not opened:
+                        return CheckMaxMessageResult(reply_value="", check_ok=False)
+                    await self._maybe_capture_chat_id(page, phone)
 
-                if payload.get("error"):
-                    return CheckMaxMessageResult(reply_value="", check_ok=False)
+                    await self._wait_and_get_first(page, _CHAT_HISTORY_SELECTORS, timeout_ms=8000)
+                    payload = await page.evaluate(_PARSE_LAST_MESSAGE_JS)
+                    
+                    if payload.get("error"):
+                        return CheckMaxMessageResult(reply_value="", check_ok=False)
 
-                variant = (payload.get("variant") or "").strip().casefold()
-                is_out = bool(payload.get("isOut"))
-                text = str(payload.get("text") or "").strip()
-                status_icon = str(payload.get("statusIcon") or "")
+                    variant = (payload.get("variant") or "").strip().casefold()
+                    is_out = bool(payload.get("isOut"))
+                    text = str(payload.get("text") or "").strip()
+                    status_icon = str(payload.get("statusIcon") or "")
 
-                logger.info(f"Debug: is_out={is_out}, variant={variant}, statusIcon={status_icon}")
+                    logger.info(f"Debug: is_out={is_out}, variant={variant}, statusIcon={status_icon}")
 
-                is_viewed = False
-                status_icon_lower = status_icon.lower()
-                if is_out and (
+                    is_viewed = False
+                    status_icon_lower = status_icon.lower()
+                    if is_out and (
                         "check-double" in status_icon_lower or
                         "read" in status_icon_lower or
                         "viewed" in status_icon_lower or
                         "seen" in status_icon_lower
-                ):
-                    is_viewed = True
-
-                if variant == "incoming" or not is_out:
-                    return CheckMaxMessageResult(
-                        reply_value=text,
-                        check_ok=True,
-                        replied_at=datetime.utcnow().isoformat() + "Z"
-                    )
-
-                return CheckMaxMessageResult(reply_value="", check_ok=True, is_viewed=is_viewed)
+                    ):
+                        is_viewed = True
+                    
+                    if variant == "incoming" or not is_out:
+                        return CheckMaxMessageResult(
+                            reply_value=text, 
+                            check_ok=True, 
+                            replied_at=datetime.utcnow().isoformat() + "Z"
+                        )
+                    
+                    return CheckMaxMessageResult(reply_value="", check_ok=True, is_viewed=is_viewed)
+                finally:
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
             finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
+                await context.close()
         except Exception as e:
             logger.exception(f"Error checking reply for {phone}")
             return CheckMaxMessageResult(reply_value="", check_ok=False)
-
 
     async def _maybe_capture_chat_id(self, page: Page, phone: str) -> None:
         chat_id = _extract_chat_id_from_url(page.url)
