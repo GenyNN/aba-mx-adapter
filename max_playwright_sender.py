@@ -92,10 +92,19 @@ _FIND_CONTACT_SUBMIT_SELECTORS = [
 ]
 _MESSAGE_INPUT_SELECTORS = [
     "div[contenteditable='true'][role='textbox']",
+    "div[contenteditable=''][role='textbox']",
+    "div[contenteditable][role='textbox']",
     "div[contenteditable='true'][data-testid*='composer']",
+    "div[contenteditable][data-testid*='composer']",
     "textarea[placeholder*='Сообщение']",
     "textarea[placeholder*='Message']",
-    "div[placeholder*='Message']"
+    "span[placeholder*='Message']",
+    "span[placeholder*='Сообщение']",
+    "div[placeholder*='Сообщение']",
+    "div[placeholder*='Message']",
+    "div[aria-placeholder*='Сообщение']",
+    "div[aria-placeholder*='Message']",
+    "div[data-lexical-editor='true']",
 ]
 _ATTACH_BUTTON_SELECTORS = [
     "button:has(use[href*='paperclip'])",
@@ -732,7 +741,7 @@ class MaxBrowserManager:
         await page.click(selector)
         if not text:
             return
-        delay_ms = random.randint(25, 90)
+        delay_ms = random.randint(5, 30) #
         parts = text.split("\n")
         await page.keyboard.type(parts[0], delay=delay_ms)
         for part in parts[1:]:
@@ -824,7 +833,7 @@ class MaxBrowserManager:
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
                     if humanize:
-                        human_delay = random.uniform(10, 30)
+                        human_delay = random.uniform(5, 15) #0 0
                         logger.info(f"Human-like delay {human_delay:.1f}s before typing")
                         await asyncio.sleep(human_delay)
 
