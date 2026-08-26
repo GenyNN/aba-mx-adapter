@@ -4,7 +4,13 @@ import logging
 import os
 import random
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import List, Optional
+
+from dotenv import load_dotenv
+
+_PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 try:
     from zoneinfo import ZoneInfo
