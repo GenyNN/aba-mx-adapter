@@ -135,11 +135,32 @@ _ATTACHMENT_PREVIEW_SELECTORS = [
 ]
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif", ".tiff", ".tif"}
+_INVISIBLE_CHARS = [
+    "\u200B",  # Zero-Width Space
+    "\u200C",  # Zero-Width Non-Joiner
+    "\u200D",  # Zero-Width Joiner
+    "\u2060",  # Word Joiner
+    "\uFEFF",  # Zero-Width No-Break Space (BOM)
+    "\u180E",  # Mongolian Vowel Separator
+]
 
 
 def _is_image_file(path: Path) -> bool:
     ext = path.suffix.lower()
     return ext in _IMAGE_EXTENSIONS
+
+
+def _randomize_text_with_invisible_chars(text: str) -> str:
+    """Append 1-10 random zero-width chars to make each message hash-unique."""
+    if not text:
+        return text
+
+    # Генерируем от 1 до 10 случайных невидимых символов
+    count = random.randint(1, 10)
+    suffix = "".join(random.choice(_INVISIBLE_CHARS) for _ in range(count))
+
+    return text + suffix
+
 #"div[placeholder*='Messagne'
 _OPENED_CHAT_SELECTORS = [".openedChat", "[class*='openedChat']"]
 _CHAT_HISTORY_SELECTORS = [".openedChat .history", "[class*='openedChat'] [class*='history']"]
@@ -299,6 +320,25 @@ class MaxBrowserManager:
                 user_data_dir=str(user_data_path),
                 headless=self.headless,
                 channel=self.browser_channel,
+                ignore_default_args=["--enable-automation"],
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-infobars",
+                ],
+            )
+            # Hide Playwright / automation fingerprint before any page scripts run.
+            await self.context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', {
+                  get: () => undefined,
+                });
+                // Also neutralize other common automation markers if present.
+                try {
+                  window.chrome = window.chrome || { runtime: {} };
+                } catch (_) {}
+                """
             )
             self.context.set_default_timeout(30000)
             self.context.set_default_navigation_timeout(45000)
@@ -837,6 +877,8 @@ class MaxBrowserManager:
                         logger.info(f"Human-like delay {human_delay:.1f}s before typing")
                         await asyncio.sleep(human_delay)
 
+                    randomized_text = _randomize_text_with_invisible_chars(text)
+
                     await page.click(message_selector)
                     if attachment_path:
                         try:
@@ -844,7 +886,7 @@ class MaxBrowserManager:
                         except Exception as e:
                             return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
 
-                    await self._type_like_human(page, message_selector, text)
+                    await self._type_like_human(page, message_selector, randomized_text)
                     await page.keyboard.press("Enter")
                     try:
                         await page.wait_for_function(
