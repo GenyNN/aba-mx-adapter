@@ -741,7 +741,7 @@ class MaxBrowserManager:
         await page.click(selector)
         if not text:
             return
-        delay_ms = random.randint(5, 30) #
+        delay_ms = random.randint(1, 4) #5 30
         parts = text.split("\n")
         await page.keyboard.type(parts[0], delay=delay_ms)
         for part in parts[1:]:
@@ -833,7 +833,7 @@ class MaxBrowserManager:
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
                     if humanize:
-                        human_delay = random.uniform(5, 15) #0 0
+                        human_delay = random.uniform(1, 4) #5 15
                         logger.info(f"Human-like delay {human_delay:.1f}s before typing")
                         await asyncio.sleep(human_delay)
 
