@@ -868,7 +868,7 @@ class MaxBrowserManager:
                         logger.info(f"Human-like delay {human_delay:.1f}s before typing")
                         await asyncio.sleep(human_delay)
 
-                    randomized_text = _randomize_text_with_invisible_chars(text)
+                    randomized_text = text #_randomize_text_with_invisible_chars()
 
                     await page.click(message_selector)
                     if attachment_path:
