@@ -773,7 +773,7 @@ class MaxBrowserManager:
         await page.click(selector)
         if not text:
             return
-        delay_ms = random.randint(1, 4) #5 30
+        delay_ms = random.randint(1, 4) #5 30 #
         parts = text.split("\n")
         await page.keyboard.type(parts[0], delay=delay_ms)
         for part in parts[1:]:
