@@ -80,6 +80,7 @@ class CheckMaxMessageResult:
     check_ok: bool = True
     replied_at: Optional[str] = None
     is_viewed: bool = False
+    from_ws_cache: bool = False
 
 # --- Selectors ---
 _SEARCH_PLUS_BUTTON_SELECTORS = ["button:has(use[href='#icon_plus'])"]
@@ -228,7 +229,6 @@ class MaxBrowserManager:
         self._restart_task: Optional[asyncio.Task] = None
         self._ws_actions: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._viewer_id: Optional[int] = None
-        self._current_phone_for_mapping: Optional[str] = None
         self._chat_by_phone: "OrderedDict[str, str]" = OrderedDict()
         self._phone_by_chat_id: "OrderedDict[str, str]" = OrderedDict()
         self._chat_status: Dict[str, Dict[str, Any]] = {}
@@ -459,9 +459,6 @@ class MaxBrowserManager:
             f"page_ok n={startup_n} pid={os.getpid()} caller={caller}"
         )
 
-    async def _attach_ws_sniffer_to_page(self, page: Page, phone_for_mapping: Optional[str]) -> None:
-        self._current_phone_for_mapping = phone_for_mapping
-
     async def _on_ws_sniffer_emit(self, data: Dict[str, Any]):
         try:
             if not isinstance(data, dict):
@@ -482,11 +479,6 @@ class MaxBrowserManager:
             if not decoded:
                 return
             payload = decoded.get("payload")
-            phone_for_mapping = self._current_phone_for_mapping
-            if phone_for_mapping and isinstance(payload, dict):
-                chat_id = payload.get("chatId")
-                if chat_id is not None:
-                    self._cache_phone_chat(phone=phone_for_mapping, chat_id=str(chat_id))
             max_opcode = decoded.get("opcode")
             if max_opcode in (128, 130, 50):
                 await self._handle_max_protocol_event(direction, decoded)
@@ -832,7 +824,6 @@ class MaxBrowserManager:
         last_err: Optional[BaseException] = None
         for attempt in range(2):
             async with self._op_lock:
-                self._current_phone_for_mapping = phone
                 try:
                     page = await self._ensure_page()
                     self.tasks_count += 1
@@ -926,8 +917,6 @@ class MaxBrowserManager:
                         await self._restart_browser("exception")
                         continue
                     return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
-                finally:
-                    self._current_phone_for_mapping = None
         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(last_err) if last_err else "unknown")
 
     async def check_reply(self, phone: str, base_url: str = DEFAULT_BASE_URL) -> CheckMaxMessageResult:
@@ -937,7 +926,6 @@ class MaxBrowserManager:
         last_err: Optional[BaseException] = None
         for attempt in range(2):
             async with self._op_lock:
-                self._current_phone_for_mapping = None
                 try:
                     page = await self._ensure_page()
                     self.tasks_count += 1
@@ -1005,8 +993,6 @@ class MaxBrowserManager:
                         await self._restart_browser("exception")
                         continue
                     return CheckMaxMessageResult(reply_value="", check_ok=False)
-                finally:
-                    self._current_phone_for_mapping = None
         return CheckMaxMessageResult(reply_value="", check_ok=False)
 
     async def _maybe_capture_chat_id(self, page: Page, phone: str) -> None:
@@ -1089,6 +1075,7 @@ class MaxBrowserManager:
                 reply_value=incoming_text,
                 check_ok=True,
                 replied_at=incoming_time or datetime.utcnow().isoformat() + "Z",
+                from_ws_cache=True,
             )
         if st.get("is_viewed"):
             return CheckMaxMessageResult(reply_value="", check_ok=True, is_viewed=True)

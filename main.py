@@ -174,7 +174,7 @@ class MaxWorkerDaemon:
         for i, reply in enumerate(task.replies, start=1):
             moscow_time = to_moscow_time(reply.time)
             time_str = moscow_time.strftime("%Y-%m-%d %H:%M:%S")
-            lines.append(f"\n{i}. 📱 {reply.user_phone} ({reply.user_name})")
+            lines.append(f"\n{i}. 📱 {reply.user_phone} ") #({reply.user_name})
             lines.append(f"   💬 Ответ: {reply.message}")
             lines.append(f"   🕒 Время: {time_str}")
         return "\n".join(lines)
@@ -197,10 +197,11 @@ class MaxWorkerDaemon:
 
                 # Send message (use_chat_id=True if the orchestrator already knows the admin's chat_id)
                 use_chat_id = bool(task.use_chat_id and task.chat_id)
+                await asyncio.sleep(random.uniform(2.0, 6.0))
                 result = await self.browser_manager.send_message(
                     phone,
                     notification_text,
-                    humanize=False,
+                    humanize=True,
                     chat_id=task.chat_id,
                     use_chat_id=use_chat_id,
                 )
@@ -338,6 +339,18 @@ class MaxWorkerDaemon:
 
                     if result.check_ok and result.reply_value:
                         # Has a reply
+                        if result.from_ws_cache:
+                            # This reply was already detected and forwarded to the orchestrator
+                            # via the WebSocket forwarder (forward_ws_events). Publishing a
+                            # duplicate TargetResult here would cause the orchestrator to
+                            # generate a second tenant_admin_notify task, resulting in
+                            # duplicate notifications to the administrator.
+                            logger.info(
+                                f"Skipping duplicate TargetResult for {target.phone_normalized}: "
+                                f"reply already reported via WebSocket"
+                            )
+                            continue
+
                         target_result = TargetResult(
                             target_id=target.target_id,
                             campaign_id=task.campaign_id,
