@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional
 
@@ -14,11 +14,16 @@ load_dotenv(_PROJECT_ROOT / ".env", override=False)
 
 try:
     from zoneinfo import ZoneInfo
+    try:
+        MSK_TZ = ZoneInfo("Europe/Moscow")
+    except Exception:
+        MSK_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 except ImportError:
-    # Python < 3.9 fallback
     from backports.zoneinfo import ZoneInfo  # type: ignore
-
-MSK_TZ = ZoneInfo("Europe/Moscow")
+    try:
+        MSK_TZ = ZoneInfo("Europe/Moscow")
+    except Exception:
+        MSK_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 
 
 def to_moscow_time(dt: datetime) -> datetime:
@@ -80,8 +85,8 @@ class PollTask(BaseModel):
     targets: List[PollTarget]
 
 class TargetResult(BaseModel):
-    target_id: str
-    campaign_id: str
+    target_id: Optional[str] = None
+    campaign_id: Optional[str] = None
     tenant_id: Optional[str] = None
     phone_number: str
     status: str
@@ -211,13 +216,13 @@ class MaxWorkerDaemon:
                     # and subsequent notifications are sent by chat_id.
                     try:
                         await self.publish_result(TargetResult(
-                            target_id="",
-                            campaign_id="",
-                            tenant_id=task.tenant_id or "",
+                            target_id=None,
+                            campaign_id=None,
+                            tenant_id=task.tenant_id or None,
                             phone_number=phone,
                             status="sent",
                             timestamp=datetime.utcnow().isoformat() + "Z",
-                            chat_id=result.chat_id or task.chat_id or "",
+                            chat_id=result.chat_id or task.chat_id or None,
                             messenger_type="MAX",
                         ))
                     except Exception as pub_err:

@@ -229,6 +229,7 @@ class MaxBrowserManager:
         self._restart_task: Optional[asyncio.Task] = None
         self._ws_actions: asyncio.Queue = asyncio.Queue(maxsize=2000)
         self._viewer_id: Optional[int] = None
+        self._current_phone_for_mapping: Optional[str] = None
         self._chat_by_phone: "OrderedDict[str, str]" = OrderedDict()
         self._phone_by_chat_id: "OrderedDict[str, str]" = OrderedDict()
         self._chat_status: Dict[str, Dict[str, Any]] = {}
@@ -552,6 +553,9 @@ class MaxBrowserManager:
             else:
                 st["last_outgoing_text"] = msg_text
                 st["last_outgoing_time"] = msg_time_iso
+                phone_for_mapping = self._current_phone_for_mapping
+                if phone_for_mapping:
+                    self._cache_phone_chat(phone=phone_for_mapping, chat_id=chat_id_str)
         elif opcode == 130:
             chat_id = payload.get("chatId")
             user_id = payload.get("userId")
@@ -824,6 +828,7 @@ class MaxBrowserManager:
         last_err: Optional[BaseException] = None
         for attempt in range(2):
             async with self._op_lock:
+                self._current_phone_for_mapping = phone
                 try:
                     page = await self._ensure_page()
                     self.tasks_count += 1
@@ -838,6 +843,7 @@ class MaxBrowserManager:
                         pass
 
                     if use_chat_id and chat_id:
+                        self._cache_phone_chat(phone=phone, chat_id=str(chat_id))
                         if not await self._open_chat_by_chat_id(page, chat_id, base_url):
                             return SendMaxMessageResult(
                                 sent_ok=False,
@@ -857,14 +863,14 @@ class MaxBrowserManager:
 
                     await self._maybe_capture_chat_id(page, phone)
                     if phone not in self._chat_by_phone:
-                        await self._wait_for_chat_id(phone, timeout_seconds=5.0)
+                        await self._wait_for_chat_id(phone, timeout_seconds=3.0)
 
                     message_selector = await self._wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=3000)
                     if not message_selector:
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
                     if humanize:
-                        human_delay = random.uniform(1, 4) #5 15
+                        human_delay = random.uniform(1, 7) #5 15
                         logger.info(f"Human-like delay {human_delay:.1f}s before typing")
                         await asyncio.sleep(human_delay)
 
@@ -892,10 +898,19 @@ class MaxBrowserManager:
                     except PlaywrightTimeoutError:
                         pass
 
+                    await self._maybe_capture_chat_id(page, phone)
+                    if phone not in self._chat_by_phone:
+                        await self._wait_for_chat_id(phone, timeout_seconds=5.0)
+
+                    captured_chat_id = self._chat_by_phone.get(phone) or chat_id
+                    if not captured_chat_id:
+                        logger.error(
+                            f"chat_id not captured after send phone={phone} url={getattr(page, 'url', '')}"
+                        )
                     return SendMaxMessageResult(
                         sent_ok=True,
                         status_note="delivered",
-                        chat_id=self._chat_by_phone.get(phone) or chat_id,
+                        chat_id=captured_chat_id,
                     )
                 except ContactNotFoundError as e:
                     return SendMaxMessageResult(
@@ -917,6 +932,8 @@ class MaxBrowserManager:
                         await self._restart_browser("exception")
                         continue
                     return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
+                finally:
+                    self._current_phone_for_mapping = None
         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(last_err) if last_err else "unknown")
 
     async def check_reply(self, phone: str, base_url: str = DEFAULT_BASE_URL) -> CheckMaxMessageResult:
@@ -1097,10 +1114,13 @@ def normalize_phone_for_max(raw: Union[str, int, float, None]) -> Optional[str]:
 def _extract_chat_id_from_url(url: str) -> Optional[str]:
     if not url:
         return None
-    m = re.search(r"(?:chatId=|chat/|chats/)(\d+)", url)
+    m = re.search(r"(?:chatId=|chat_id=|chat/|chats/)(\d+)", url)
     if m:
         return m.group(1)
     m = re.search(r"[#&?]c(?:hat)?=(\d+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"https?://[^/]+/(\d+)(?:[/?#]|$)", url)
     if m:
         return m.group(1)
     return None
