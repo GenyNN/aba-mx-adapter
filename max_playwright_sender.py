@@ -133,7 +133,33 @@ _ATTACHMENT_PREVIEW_SELECTORS = [
     "[class*='attachment']",
     "[data-testid*='attachment']",
     "a[href][download]",
+    "img[src^='blob:']",
+    "img[src^='data:']",
 ]
+
+_ATTACHMENT_PREVIEW_READY_JS = """
+() => {
+  const root =
+    document.querySelector('.openedChat') ||
+    document.querySelector('[class*="openedChat"]') ||
+    document.body;
+  if (!root) return false;
+  const imgs = [...root.querySelectorAll('img')];
+  for (const img of imgs) {
+    const src = img.getAttribute('src') || '';
+    const ready = img.complete && img.naturalWidth > 0;
+    if (!ready) continue;
+    if (src.startsWith('blob:') || src.startsWith('data:')) return true;
+    const inPreview = img.closest('[class*="attach"], [class*="Attach"], [class*="preview"], [class*="composer"], [class*="messageInput"]');
+    if (inPreview) return true;
+  }
+  return !!(
+    root.querySelector('[class*="attachment"]') ||
+    root.querySelector('[data-testid*="attachment"]') ||
+    root.querySelector('a[href][download]')
+  );
+}
+"""
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif", ".tiff", ".tif"}
 _INVISIBLE_CHARS = [
@@ -166,13 +192,30 @@ def _randomize_text_with_invisible_chars(text: str) -> str:
 _OPENED_CHAT_SELECTORS = [".openedChat", "[class*='openedChat']"]
 _CHAT_HISTORY_SELECTORS = [".openedChat .history", "[class*='openedChat'] [class*='history']"]
 _BACK_BUTTON_SELECTORS = ["button.backBtn", "button:has(use[href='#icon_arrow_left'])"]
+# Real Max UI (EN example): <dialog data-testid="modal" open> with
+# header "Number +7920… not found" and action "Find another number".
+# RU copy uses "Не нашли номер" / "Найти другой номер". Do not wait on
+# outdated "Пользователь не найден" strings — they never appear and used
+# to burn 2.5s × N selectors before the chat-input wait loop.
 _USER_NOT_FOUND_SELECTORS = [
+    'dialog[data-testid="modal"][open]',
+    "dialog[open] #modalHeaderTitle",
+    "text=Не нашли номер",
+    "text=Найти другой номер",
+    "text=Find another number",
     "text=Пользователь не найден",
-    "text=пользователь не найден",
-    "text=Никого не найдено",
     "text=User not found",
     "text=No users found",
 ]
+
+_USER_NOT_FOUND_MODAL_JS = """
+() => {
+  const dialog = document.querySelector('dialog[data-testid="modal"][open], dialog.container[open], dialog[open]');
+  if (!dialog) return false;
+  const text = (dialog.innerText || '').replace(/\\s+/g, ' ');
+  return /not found|не нашли номер|найти другой номер|find another number|пользователь не найден|отправьте ссылку|invite link/i.test(text);
+}
+"""
 
 _PARSE_LAST_MESSAGE_JS = """
 () => {
@@ -638,19 +681,110 @@ class MaxBrowserManager:
 
         await context.route("**/*", route_handler)
 
+    def _pw_selector(self, selector: str) -> str:
+        if selector.startswith("//") or selector.startswith(".//"):
+            return "xpath=" + selector
+        return selector
+
     async def _wait_and_get_first(self, page: Page, selectors: Iterable[str], timeout_ms: int = 7000) -> Optional[str]:
-        for sel in selectors:
-            selector = sel
-            # Playwright wait_for_selector accepts CSS by default. Auto-prefix xpath= for
-            # XPath-style selectors (//...) so callers don't need to remember to add it.
-            if selector.startswith("//") or selector.startswith(".//"):
-                selector = "xpath=" + selector
+        """Wait until ANY selector matches, using a single shared timeout.
+
+        Trae's sequential remaining-ms rewrite was wrong: the first *non-matching*
+        selector consumed the entire budget, so later real selectors (e.g.
+        contenteditable='') never ran and healthy chats failed. Race waits instead.
+        """
+        sels = [s for s in selectors if s]
+        if not sels:
+            return None
+        for sel in sels:
             try:
-                await page.wait_for_selector(selector, timeout=timeout_ms)
-                return sel
-            except PlaywrightTimeoutError:
+                handle = await page.query_selector(self._pw_selector(sel))
+                if handle:
+                    return sel
+            except Exception:
                 continue
-        return None
+
+        found: asyncio.Future = asyncio.get_running_loop().create_future()
+
+        async def wait_one(sel: str) -> None:
+            try:
+                await page.wait_for_selector(self._pw_selector(sel), timeout=timeout_ms)
+                if not found.done():
+                    found.set_result(sel)
+            except Exception:
+                return
+
+        tasks = [asyncio.create_task(wait_one(sel)) for sel in sels]
+        try:
+            return await asyncio.wait_for(asyncio.shield(found), timeout=timeout_ms / 1000.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return None
+        finally:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _human_pause(self, min_ms: int = 200, max_ms: int = 500) -> None:
+        await asyncio.sleep(random.uniform(min_ms, max_ms) / 1000.0)
+
+    async def _is_user_not_found_modal(self, page: Page) -> bool:
+        try:
+            return bool(await page.evaluate(_USER_NOT_FOUND_MODAL_JS))
+        except Exception:
+            return False
+
+    async def _dismiss_user_not_found_overlay(self, page: Page) -> None:
+        """Leave the not-found dialog without clicking its action buttons.
+
+        The open <dialog> intercepts pointer events, so one Plus click is absorbed.
+        A second Plus click (same control used to search a new cold number) unblocks
+        the UI for the next queued recipient.
+        """
+        plus = page.locator(_SEARCH_PLUS_BUTTON_SELECTORS[0]).first
+        try:
+            await plus.click(timeout=250)
+        except Exception:
+            pass
+        await asyncio.sleep(0.12)
+        try:
+            await plus.click(timeout=500, force=True)
+        except Exception:
+            pass
+        await asyncio.sleep(0.12)
+        try:
+            still_open = await self._is_user_not_found_modal(page)
+        except Exception:
+            still_open = False
+        if still_open:
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+    async def _wait_for_chat_or_not_found(self, page: Page, timeout_ms: int = 4000) -> str:
+        """Return 'chat', 'not_found', or 'timeout' within timeout_ms total."""
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+        chat_loc = page.locator(".openedChat, [class*='openedChat']")
+        while asyncio.get_event_loop().time() < deadline:
+            if await self._is_user_not_found_modal(page):
+                return "not_found"
+            try:
+                if await chat_loc.count() > 0:
+                    return "chat"
+            except Exception:
+                pass
+            for sel in _MESSAGE_INPUT_SELECTORS[:4]:
+                try:
+                    handle = await page.query_selector(self._pw_selector(sel))
+                    if handle:
+                        return "chat"
+                except Exception:
+                    continue
+            await asyncio.sleep(0.1)
+        if await self._is_user_not_found_modal(page):
+            return "not_found"
+        return "timeout"
 
     async def _diag_snapshot(self, page: Page, prefix: str) -> None:
         """Best-effort diagnostic snapshot for debugging selector wait failures."""
@@ -706,42 +840,57 @@ class MaxBrowserManager:
 
     async def _open_chat_by_phone(self, page: Page, phone: str) -> bool:
         logger.info(f"Opening chat for phone: {phone}")
+        if await self._is_user_not_found_modal(page):
+            await self._dismiss_user_not_found_overlay(page)
+
         # Return to chat list if needed
         if await page.locator(".openedChat, [class*='openedChat']").count() > 0:
             back_selector = await self._wait_and_get_first(page, _BACK_BUTTON_SELECTORS, timeout_ms=2000)
             if back_selector:
-                await page.click(back_selector)
+                await page.click(back_selector, timeout=3000)
                 await self._wait_and_get_first(page, _SEARCH_PLUS_BUTTON_SELECTORS, timeout_ms=2000)
 
         open_selector = await self._wait_and_get_first(page, _SEARCH_PLUS_BUTTON_SELECTORS, timeout_ms=10000)
         if not open_selector:
             await self._diag_snapshot(page, "plus_button_missing")
             raise MaxMessengerError("Button 'Начать общение' not found.")
-        await page.click(open_selector)
+        await self._human_pause(1000, 2000)
+        await page.click(open_selector, timeout=5000)
+        await self._human_pause(1000, 2000)
 
         find_by_number_selector = await self._wait_and_get_first(page, _FIND_BY_NUMBER_ITEM_MENU_SELECTORS, timeout_ms=5000)
         if not find_by_number_selector:
             raise MaxMessengerError("Menu item 'Найти по номеру' not found.")
-        await page.click(find_by_number_selector)
+        await page.click(find_by_number_selector, timeout=4000)
 
         phone_input_selector = await self._wait_and_get_first(page, _CONTACT_NUMBER_INPUT_SELECTORS, timeout_ms=8000)
         if not phone_input_selector:
             raise MaxMessengerError("Phone input not found.")
 
         await page.fill(phone_input_selector, phone)
+        await self._human_pause(1000, 2000)
 
         submit_selector = await self._wait_and_get_first(page, _FIND_CONTACT_SUBMIT_SELECTORS, timeout_ms=8000)
         if not submit_selector:
             raise MaxMessengerError("Submit button 'Найти в MAX' not found.")
-        await page.click(submit_selector)
+        await page.click(submit_selector, timeout=4000)
+        await self._human_pause(120, 280)
 
-        not_found_selector = await self._wait_and_get_first(page, _USER_NOT_FOUND_SELECTORS, timeout_ms=2500)
-        if not_found_selector:
+        outcome = await self._wait_for_chat_or_not_found(page, timeout_ms=4000)
+        if outcome == "not_found":
+            logger.info(f"User-not-found modal detected for phone={phone}")
+            await self._dismiss_user_not_found_overlay(page)
             raise ContactNotFoundError(f"User not found by phone: {phone}")
+        if outcome == "chat":
+            return True
 
-        # Auto-wait for chat to open (no arbitrary sleep buffers)
-        chat_found = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=10000)
+        # Fallback: modal copy may differ; still do not burn 17×10s selector waits.
+        if await self._wait_and_get_first(page, _USER_NOT_FOUND_SELECTORS, timeout_ms=400):
+            await self._dismiss_user_not_found_overlay(page)
+            raise ContactNotFoundError(f"User not found by phone: {phone}")
+        chat_found = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=1500)
         if not chat_found:
+            await self._dismiss_user_not_found_overlay(page)
             raise ContactNotFoundError(f"User not found by phone: {phone}")
         return True
 
@@ -774,18 +923,35 @@ class MaxBrowserManager:
         return False
 
     async def _type_like_human(self, page: Page, selector: str, text: str) -> None:
-        await page.click(selector)
+        await page.click(selector, timeout=3000)
         if not text:
             return
-        delay_ms = random.randint(1, 4) #5 30 #
-        parts = text.split("\n")
-        await page.keyboard.type(parts[0], delay=delay_ms)
-        for part in parts[1:]:
-            await page.keyboard.down("Shift")
-            await page.keyboard.press("Enter")
-            await page.keyboard.up("Shift")
-            if part:
-                await page.keyboard.type(part, delay=delay_ms)
+        await self._human_pause(80, 220)
+        # insert_text fires InputEvents like a paste; avoids 1–4ms/char keyboard.type.
+        await page.keyboard.insert_text(text)
+
+    async def _attachment_preview_ready(self, page: Page) -> bool:
+        try:
+            if await page.evaluate(_ATTACHMENT_PREVIEW_READY_JS):
+                return True
+        except Exception:
+            pass
+        for sel in _ATTACHMENT_PREVIEW_SELECTORS:
+            try:
+                handle = await page.query_selector(self._pw_selector(sel))
+                if handle:
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _wait_for_attachment_preview(self, page: Page, timeout_ms: int = 15000) -> bool:
+        deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
+        while asyncio.get_event_loop().time() < deadline:
+            if await self._attachment_preview_ready(page):
+                return True
+            await asyncio.sleep(0.15)
+        return False
 
     async def _attach_file_to_chat(self, page: Page, attachment_path: Union[str, Path]) -> None:
         path = Path(attachment_path)
@@ -813,7 +979,14 @@ class MaxBrowserManager:
         chooser = await fc_info.value
         await chooser.set_files(str(path))
 
-        await self._wait_and_get_first(page, _ATTACHMENT_PREVIEW_SELECTORS, timeout_ms=15000)
+        preview_ok = await self._wait_for_attachment_preview(page, timeout_ms=15000)
+        if not preview_ok:
+            logger.warning(
+                f"Attachment preview did not appear within 15s path={path} — not sending until preview is in the composer"
+            )
+            await self._diag_snapshot(page, "attachment_preview_missing")
+            raise MaxMessengerError("Attachment preview did not appear in the composer")
+        await self._human_pause(200, 500)
 
     async def send_message(
         self,
@@ -863,20 +1036,25 @@ class MaxBrowserManager:
 
                     await self._maybe_capture_chat_id(page, phone)
                     if phone not in self._chat_by_phone:
-                        await self._wait_for_chat_id(phone, timeout_seconds=3.0)
+                        await self._wait_for_chat_id(phone, timeout_seconds=1.5)
 
-                    message_selector = await self._wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=3000)
+                    message_selector = await self._wait_and_get_first(page, _MESSAGE_INPUT_SELECTORS, timeout_ms=2500)
                     if not message_selector:
+                        if await self._is_user_not_found_modal(page):
+                            await self._dismiss_user_not_found_overlay(page)
+                            return SendMaxMessageResult(
+                                sent_ok=False,
+                                status_note="user_not_found_by_phone",
+                                error_message=f"User not found by phone: {phone}",
+                            )
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
 
                     if humanize:
-                        human_delay = random.uniform(1, 7) #5 15
-                        logger.info(f"Human-like delay {human_delay:.1f}s before typing")
-                        await asyncio.sleep(human_delay)
+                        await self._human_pause(200, 500)
 
                     randomized_text = text #_randomize_text_with_invisible_chars()
 
-                    await page.click(message_selector)
+                    await page.click(message_selector, timeout=3000)
                     if attachment_path:
                         try:
                             await self._attach_file_to_chat(page, attachment_path)
@@ -884,6 +1062,7 @@ class MaxBrowserManager:
                             return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
 
                     await self._type_like_human(page, message_selector, randomized_text)
+                    await self._human_pause(120, 320)
                     await page.keyboard.press("Enter")
                     try:
                         await page.wait_for_function(
@@ -893,14 +1072,14 @@ class MaxBrowserManager:
                                 const last = wrappers[wrappers.length - 1];
                                 return (last.className || '').includes('messageWrapper--isOut');
                             }""",
-                            timeout=5000,
+                            timeout=2500,
                         )
                     except PlaywrightTimeoutError:
                         pass
 
                     await self._maybe_capture_chat_id(page, phone)
                     if phone not in self._chat_by_phone:
-                        await self._wait_for_chat_id(phone, timeout_seconds=5.0)
+                        await self._wait_for_chat_id(phone, timeout_seconds=2.0)
 
                     captured_chat_id = self._chat_by_phone.get(phone) or chat_id
                     if not captured_chat_id:
