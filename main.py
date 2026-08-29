@@ -179,7 +179,7 @@ class MaxWorkerDaemon:
         for i, reply in enumerate(task.replies, start=1):
             moscow_time = to_moscow_time(reply.time)
             time_str = moscow_time.strftime("%Y-%m-%d %H:%M:%S")
-            lines.append(f"\n{i}. 📱 {reply.user_phone} ") #({reply.user_name})
+            lines.append(f"\n{i}. 📱 {reply.user_phone} ({reply.user_name})")
             lines.append(f"   💬 Ответ: {reply.message}")
             lines.append(f"   🕒 Время: {time_str}")
         return "\n".join(lines)

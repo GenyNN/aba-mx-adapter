@@ -854,9 +854,9 @@ class MaxBrowserManager:
         if not open_selector:
             await self._diag_snapshot(page, "plus_button_missing")
             raise MaxMessengerError("Button 'Начать общение' not found.")
-        await self._human_pause(1000, 2000)
+        await self._human_pause(1000, 4000)
         await page.click(open_selector, timeout=5000)
-        await self._human_pause(1000, 2000)
+        await self._human_pause(2000, 5000)
 
         find_by_number_selector = await self._wait_and_get_first(page, _FIND_BY_NUMBER_ITEM_MENU_SELECTORS, timeout_ms=5000)
         if not find_by_number_selector:
@@ -868,13 +868,13 @@ class MaxBrowserManager:
             raise MaxMessengerError("Phone input not found.")
 
         await page.fill(phone_input_selector, phone)
-        await self._human_pause(1000, 2000)
+        await self._human_pause(2000, 5000)
 
         submit_selector = await self._wait_and_get_first(page, _FIND_CONTACT_SUBMIT_SELECTORS, timeout_ms=8000)
         if not submit_selector:
             raise MaxMessengerError("Submit button 'Найти в MAX' not found.")
         await page.click(submit_selector, timeout=4000)
-        await self._human_pause(120, 280)
+        await self._human_pause(1200, 28000)
 
         outcome = await self._wait_for_chat_or_not_found(page, timeout_ms=4000)
         if outcome == "not_found":
