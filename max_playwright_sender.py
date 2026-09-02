@@ -367,9 +367,10 @@ class MaxBrowserManager:
                 ignore_default_args=["--enable-automation"],
                 args=[
                     "--disable-blink-features=AutomationControlled",
+                    "--test-type",  # Подавляет системные предупреждения Chrome (включая --no-sandbox)
                     "--no-sandbox",
-                    "--disable-setuid-sandbox",
                     "--disable-infobars",
+                    "--silent-debugger-extension-api",
                 ],
             )
             # Hide Playwright / automation fingerprint before any page scripts run.
