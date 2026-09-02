@@ -162,13 +162,11 @@ _ATTACHMENT_PREVIEW_READY_JS = """
 """
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif", ".tiff", ".tif"}
-_INVISIBLE_CHARS = [
+_SAFE_INVISIBLE_CHARS = [
     "\u200B",  # Zero-Width Space
     "\u200C",  # Zero-Width Non-Joiner
-    "\u200D",  # Zero-Width Joiner
-    "\u2060",  # Word Joiner
-    "\uFEFF",  # Zero-Width No-Break Space (BOM)
-    "\u180E",  # Mongolian Vowel Separator
+    "\u200E",  # Left-to-Right Mark
+    "\u200F",  # Right-to-Left Mark
 ]
 
 
@@ -178,13 +176,14 @@ def _is_image_file(path: Path) -> bool:
 
 
 def _randomize_text_with_invisible_chars(text: str) -> str:
-    """Append 1-10 random zero-width chars to make each message hash-unique."""
+    """Добавляет к тексту суффикс из 3–21 рандомных безопасных невидимых символов."""
     if not text:
         return text
 
-    # Генерируем от 1 до 10 случайных невидимых символов
-    count = random.randint(1, 10)
-    suffix = "".join(random.choice(_INVISIBLE_CHARS) for _ in range(count))
+    suffix_len = random.randint(3, 21)
+    suffix = "".join(
+        random.choice(_SAFE_INVISIBLE_CHARS) for _ in range(suffix_len)
+    )
 
     return text + suffix
 
@@ -1053,7 +1052,7 @@ class MaxBrowserManager:
                     if humanize:
                         await self._human_pause(200, 500)
 
-                    randomized_text = text #_randomize_text_with_invisible_chars()
+                    randomized_text = _randomize_text_with_invisible_chars(text)
 
                     await page.click(message_selector, timeout=3000)
                     if attachment_path:
